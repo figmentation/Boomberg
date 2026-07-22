@@ -1,0 +1,78 @@
+# ============================================================================
+# Secrets — never commit real credentials. `.env.example` IS tracked.
+# ============================================================================
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets.toml
+.streamlit/secrets.toml
+
+# ============================================================================
+# Open-Terminal runtime state
+# ============================================================================
+# SQLite object cache + requests-cache databases. Regenerated on demand and
+# hundreds of MB after a few sessions — never useful in history.
+.openterm/
+*.sqlite
+*.sqlite3
+*.db
+
+# Streamlit server logs written by the local run scripts
+server.log
+server.err
+
+# ============================================================================
+# Python
+# ============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# ============================================================================
+# Testing / tooling
+# ============================================================================
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# ============================================================================
+# Editors & OS
+# ============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Claude Code local machine-specific settings (project settings.json would be
+# tracked; the .local variant is per-developer).
+.claude/settings.local.json
+
+# ============================================================================
+# Playwright
+# ============================================================================
+playwright-report/
+test-results/

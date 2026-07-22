@@ -1,0 +1,23 @@
+# Normalise line endings so the repo stays consistent across platforms.
+# Text files are stored LF in the repo and checked out native on Windows.
+* text=auto
+
+*.py    text diff=python
+*.md    text
+*.txt   text
+*.ini   text
+*.toml  text
+*.yml   text
+*.yaml  text
+*.json  text
+*.cfg   text
+
+# Shell scripts must keep LF even on Windows or they break under bash.
+*.sh    text eol=lf
+
+# Binary — never diff or convert.
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.pdf   binary
+*.sqlite binary

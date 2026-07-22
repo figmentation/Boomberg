@@ -1,0 +1,1176 @@
+"""
+data_fetchers/equities.py :: Module A - Equity & Fundamentals Analysis.
+
+Bloomberg equivalents: <EQUITY> GP (price graph), DES (description),
+FA (financial analysis), RV (relative value).
+
+Data sources, all free:
+  * yfinance          - OHLCV, quotes, options chains, company profile.
+  * SEC EDGAR         - Filings index + XBRL "company facts" for real,
+                        as-reported financial statements. Official JSON API
+                        at data.sec.gov: no key, no scraping, no rate cost
+                        beyond a 10 req/s fair-use ceiling and a mandatory
+                        descriptive User-Agent.
+  * OpenBB SDK        - Used opportunistically if the user installed it.
+
+Everything returns pandas objects and never raises into the UI layer: a
+failed fetch yields an empty DataFrame/dict so the page still renders.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+import config
+from utils.cache import cached, get_session
+from utils.rate_limiter import retry_with_backoff, throttled
+
+log = logging.getLogger("openterm.equities")
+
+# yfinance is imported lazily-ish but at module scope so failures surface once.
+try:
+    import yfinance as yf
+
+    YFINANCE_AVAILABLE = True
+except Exception as exc:  # pragma: no cover
+    log.error("yfinance import failed: %s", exc)
+    yf = None  # type: ignore[assignment]
+    YFINANCE_AVAILABLE = False
+
+# OpenBB is a heavy optional extra. Detect once, use if present.
+try:
+    from openbb import obb  # type: ignore
+
+    OPENBB_AVAILABLE = True
+except Exception:
+    obb = None  # type: ignore[assignment]
+    OPENBB_AVAILABLE = False
+
+
+SEC_TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
+SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
+SEC_COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+
+
+# ==========================================================================
+# PRICE DATA
+# ==========================================================================
+@cached(ttl=config.TTL.daily_bars, namespace="equity_history")
+@throttled("yfinance")
+@retry_with_backoff(on_giveup=lambda exc: pd.DataFrame())
+def get_history(
+    ticker: str,
+    period: str = "1y",
+    interval: str = "1d",
+    auto_adjust: bool = False,
+) -> pd.DataFrame:
+    """
+    Historical OHLCV bars.
+
+    Args:
+        ticker:      Yahoo symbol. "AAPL", "BTC-USD", "CL=F", "^GSPC", "EURUSD=X".
+        period:      1d 5d 1mo 3mo 6mo 1y 2y 5y 10y ytd max
+        interval:    1m 2m 5m 15m 30m 60m 1d 1wk 1mo
+                     (Yahoo caps intraday history: 1m -> 7d, <1d -> 60d)
+        auto_adjust: Adjust OHLC for splits/dividends. Left off by default so
+                     candles match what the user sees on any other chart.
+
+    Returns:
+        DataFrame indexed by tz-aware datetime with columns
+        Open/High/Low/Close/Volume, or an empty frame on failure.
+    """
+    if not YFINANCE_AVAILABLE:
+        return pd.DataFrame()
+
+    ticker = normalize_ticker(ticker)
+    df = yf.Ticker(ticker).history(
+        period=period, interval=interval, auto_adjust=auto_adjust,
+        actions=False, timeout=config.NET.request_timeout,
+    )
+
+    if df is None or df.empty:
+        raise ValueError(f"No price history returned for {ticker}")
+
+    # yfinance occasionally returns a MultiIndex column set for single tickers.
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    df = df[[c for c in ("Open", "High", "Low", "Close", "Volume") if c in df.columns]]
+    df = df.dropna(subset=["Close"])
+    df.index.name = "Date"
+    return df
+
+
+@cached(ttl=config.TTL.quote, namespace="equity_quote")
+@throttled("yfinance")
+@retry_with_backoff(on_giveup=lambda exc: {})
+def get_quote(ticker: str) -> Dict[str, Any]:
+    """
+    Current (15-minute delayed) snapshot quote.
+
+    Uses `fast_info` where possible - it hits a lightweight endpoint and
+    avoids the expensive `.info` blob. Falls back to a 2-day history diff if
+    Yahoo's quote service is being unreliable, which it periodically is.
+    """
+    if not YFINANCE_AVAILABLE:
+        return {}
+
+    ticker = normalize_ticker(ticker)
+    tk = yf.Ticker(ticker)
+
+    price = prev_close = None
+    volume = day_high = day_low = market_cap = None
+
+    try:
+        fi = tk.fast_info
+        price = _safe_float(fi.get("lastPrice"))
+        prev_close = _safe_float(fi.get("previousClose"))
+        volume = _safe_float(fi.get("lastVolume"))
+        day_high = _safe_float(fi.get("dayHigh"))
+        day_low = _safe_float(fi.get("dayLow"))
+        market_cap = _safe_float(fi.get("marketCap"))
+    except Exception as exc:
+        log.debug("fast_info failed for %s: %s", ticker, exc)
+
+    # Fallback: derive from recent daily bars.
+    if price is None or prev_close is None:
+        hist = tk.history(period="5d", interval="1d", timeout=10)
+        if hist is None or hist.empty:
+            raise ValueError(f"No quote data for {ticker}")
+        closes = hist["Close"].dropna()
+        price = price if price is not None else _safe_float(closes.iloc[-1])
+        if prev_close is None and len(closes) >= 2:
+            prev_close = _safe_float(closes.iloc[-2])
+        if volume is None and "Volume" in hist:
+            volume = _safe_float(hist["Volume"].iloc[-1])
+
+    change = None
+    change_pct = None
+    if price is not None and prev_close:
+        change = price - prev_close
+        change_pct = (change / prev_close) * 100.0
+
+    return {
+        "ticker": ticker,
+        "price": price,
+        "previous_close": prev_close,
+        "change": change,
+        "change_pct": change_pct,
+        "volume": volume,
+        "day_high": day_high,
+        "day_low": day_low,
+        "market_cap": market_cap,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@cached(ttl=config.TTL.quote, namespace="equity_quotes_batch")
+@throttled("yfinance")
+@retry_with_backoff(on_giveup=lambda exc: {})
+def get_quotes_batch(tickers: Tuple[str, ...]) -> Dict[str, Dict[str, Any]]:
+    """
+    Snapshot quotes for many symbols in ONE Yahoo round trip.
+
+    This is what powers the ticker tape - calling get_quote() twelve times
+    would burn twelve requests every rerun and get us throttled fast.
+
+    Args:
+        tickers: Tuple (must be hashable for the cache key).
+    """
+    if not YFINANCE_AVAILABLE or not tickers:
+        return {}
+
+    symbols = [normalize_ticker(t) for t in tickers]
+
+    # 2 days of daily bars gives us last close + previous close in one call.
+    raw = yf.download(
+        tickers=" ".join(symbols),
+        period="5d",
+        interval="1d",
+        group_by="ticker",
+        auto_adjust=False,
+        progress=False,
+        threads=True,
+        timeout=config.NET.request_timeout,
+    )
+
+    if raw is None or raw.empty:
+        raise ValueError("Batch quote download returned nothing")
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for sym in symbols:
+        try:
+            # Single-symbol downloads come back without the ticker level.
+            frame = raw[sym] if isinstance(raw.columns, pd.MultiIndex) else raw
+            closes = frame["Close"].dropna()
+            if closes.empty:
+                continue
+
+            last = float(closes.iloc[-1])
+            prev = float(closes.iloc[-2]) if len(closes) >= 2 else last
+            change = last - prev
+            out[sym] = {
+                "ticker": sym,
+                "price": last,
+                "previous_close": prev,
+                "change": change,
+                "change_pct": (change / prev * 100.0) if prev else 0.0,
+                "volume": _safe_float(frame["Volume"].dropna().iloc[-1])
+                if "Volume" in frame else None,
+            }
+        except Exception as exc:
+            log.debug("Batch quote parse failed for %s: %s", sym, exc)
+
+    if not out:
+        raise ValueError("Batch quote produced no usable rows")
+    return out
+
+
+# ==========================================================================
+# TECHNICAL INDICATORS
+# ==========================================================================
+def ema(series: pd.Series, span: int) -> pd.Series:
+    """Exponential moving average. `adjust=False` matches TradingView/TA-Lib."""
+    return series.ewm(span=span, adjust=False, min_periods=span).mean()
+
+
+def sma(series: pd.Series, window: int) -> pd.Series:
+    return series.rolling(window=window, min_periods=window).mean()
+
+
+def _wilder_average(values: pd.Series, period: int) -> pd.Series:
+    """
+    Wilder's smoothed moving average, correctly seeded.
+
+    Wilder defines the series in two stages:
+        1. The first value is a SIMPLE mean of the first `period` observations.
+        2. Every later value is  avg[i] = (avg[i-1] * (period-1) + x[i]) / period.
+
+    Stage 2 is exactly `ewm(alpha=1/period, adjust=False)`. Stage 1 is not:
+    pandas seeds an unadjusted EWM from the first observation, so a single
+    early value dominates and the series stays biased for dozens of bars. On
+    Wilder's own published example that error puts RSI at 50.7 instead of
+    70.5 - enough to flip an overbought reading to neutral.
+
+    So we blank the warm-up region, plant the simple mean at the seed index,
+    and let ewm carry the recursion from there.
+
+    `values` is expected to be a diff-derived series whose first element is
+    NaN, so the first `period` real observations occupy positions 1..period.
+    """
+    if len(values) <= period:
+        return pd.Series(np.nan, index=values.index, dtype=float)
+
+    seeded = values.astype(float).copy()
+    seed = values.iloc[1:period + 1].mean()   # the first `period` changes
+
+    seeded.iloc[:period] = np.nan             # suppress the warm-up region
+    seeded.iloc[period] = seed                # plant Wilder's seed
+
+    return seeded.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """
+    Wilder's Relative Strength Index.
+
+    Verified against the worked example in Wilder's "New Concepts in
+    Technical Trading Systems": the reference series yields 70.46 / 66.25 at
+    the first two defined points, which this reproduces to within 0.01.
+    """
+    delta = series.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+
+    avg_gain = _wilder_average(gain, period)
+    avg_loss = _wilder_average(loss, period)
+
+    # avg_loss == 0 means the window had no down closes -> RS is infinite,
+    # RSI is 100 by definition. Guard the division rather than emitting inf.
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    out = 100.0 - (100.0 / (1.0 + rs))
+
+    # Restore the RSI=100 case, but only where we actually have data.
+    out = out.mask(avg_loss.eq(0.0) & avg_gain.notna(), 100.0)
+    return out.where(avg_gain.notna(), np.nan)
+
+
+def macd(
+    series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9
+) -> pd.DataFrame:
+    """Moving Average Convergence Divergence. Returns macd/signal/histogram."""
+    macd_line = ema(series, fast) - ema(series, slow)
+    signal_line = macd_line.ewm(span=signal, adjust=False, min_periods=signal).mean()
+    return pd.DataFrame({
+        "macd": macd_line,
+        "signal": signal_line,
+        "histogram": macd_line - signal_line,
+    })
+
+
+def bollinger(series: pd.Series, window: int = 20, num_std: float = 2.0) -> pd.DataFrame:
+    mid = sma(series, window)
+    std = series.rolling(window=window, min_periods=window).std()
+    return pd.DataFrame({
+        "bb_mid": mid,
+        "bb_upper": mid + num_std * std,
+        "bb_lower": mid - num_std * std,
+    })
+
+
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """
+    Average True Range - the volatility input for position sizing.
+
+    Wilder-smoothed, using the same correctly-seeded average as rsi(). True
+    range at the first bar is undefined (no previous close), so it is dropped
+    rather than treated as high-low, which would understate the seed.
+    """
+    high, low, close = df["High"], df["Low"], df["Close"]
+    prev_close = close.shift(1)
+
+    true_range = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    true_range.iloc[0] = np.nan   # undefined without a prior close
+
+    return _wilder_average(true_range, period)
+
+
+def vwap(df: pd.DataFrame) -> pd.Series:
+    """Session-anchored VWAP. Meaningful on intraday bars, not daily."""
+    typical = (df["High"] + df["Low"] + df["Close"]) / 3.0
+    cum_vol = df["Volume"].cumsum().replace(0, np.nan)
+    return (typical * df["Volume"]).cumsum() / cum_vol
+
+
+def add_indicators(
+    df: pd.DataFrame,
+    ema_periods: Iterable[int] = (20, 50, 200),
+    rsi_period: int = 14,
+    macd_params: Tuple[int, int, int] = (12, 26, 9),
+    include_bollinger: bool = True,
+) -> pd.DataFrame:
+    """
+    Attach the full indicator suite to an OHLCV frame.
+
+    Returns a copy - the input is never mutated, so cached frames stay clean.
+    """
+    if df is None or df.empty or "Close" not in df.columns:
+        return df if df is not None else pd.DataFrame()
+
+    out = df.copy()
+    close = out["Close"]
+
+    for period in ema_periods:
+        if len(out) >= period:
+            out[f"EMA{period}"] = ema(close, period)
+
+    out["RSI"] = rsi(close, rsi_period)
+
+    macd_df = macd(close, *macd_params)
+    out = out.join(macd_df)
+
+    if include_bollinger:
+        out = out.join(bollinger(close))
+
+    if {"High", "Low"}.issubset(out.columns):
+        out["ATR"] = atr(out)
+
+    # Realised volatility, annualised, from log returns.
+    out["LogReturn"] = np.log(close / close.shift(1))
+    out["Volatility20"] = out["LogReturn"].rolling(20).std() * math.sqrt(252) * 100
+
+    return out
+
+
+def summarize_technicals(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Condense the indicator frame into the signal chips shown above the chart.
+
+    Deliberately mechanical - these are descriptive readings of the indicators,
+    not trade recommendations.
+    """
+    if df is None or df.empty:
+        return {}
+
+    last = df.iloc[-1]
+    out: Dict[str, Any] = {}
+
+    rsi_val = _safe_float(last.get("RSI"))
+    if rsi_val is not None:
+        out["rsi"] = rsi_val
+        out["rsi_state"] = (
+            "OVERBOUGHT" if rsi_val >= 70
+            else "OVERSOLD" if rsi_val <= 30
+            else "NEUTRAL"
+        )
+
+    macd_val = _safe_float(last.get("macd"))
+    signal_val = _safe_float(last.get("signal"))
+    if macd_val is not None and signal_val is not None:
+        out["macd"] = macd_val
+        out["macd_state"] = "BULLISH" if macd_val > signal_val else "BEARISH"
+
+        # Detect a crossover in the last two bars.
+        if len(df) >= 2:
+            prev = df.iloc[-2]
+            prev_diff = _safe_float(prev.get("macd", 0)) - _safe_float(prev.get("signal", 0))
+            curr_diff = macd_val - signal_val
+            if prev_diff is not None and prev_diff * curr_diff < 0:
+                out["macd_cross"] = "GOLDEN" if curr_diff > 0 else "DEATH"
+
+    close = _safe_float(last.get("Close"))
+    for period in (20, 50, 200):
+        col = f"EMA{period}"
+        val = _safe_float(last.get(col))
+        if val is not None and close is not None:
+            out[col.lower()] = val
+            out[f"{col.lower()}_pos"] = "ABOVE" if close > val else "BELOW"
+
+    # Classic trend filter: 50 over 200.
+    ema50, ema200 = _safe_float(last.get("EMA50")), _safe_float(last.get("EMA200"))
+    if ema50 is not None and ema200 is not None:
+        out["trend"] = "UPTREND" if ema50 > ema200 else "DOWNTREND"
+
+    vol = _safe_float(last.get("Volatility20"))
+    if vol is not None:
+        out["volatility_annualized_pct"] = vol
+
+    atr_val = _safe_float(last.get("ATR"))
+    if atr_val is not None and close:
+        out["atr"] = atr_val
+        out["atr_pct"] = atr_val / close * 100.0
+
+    return out
+
+
+# ==========================================================================
+# COMPANY PROFILE
+# ==========================================================================
+@cached(ttl=config.TTL.fundamentals, namespace="equity_info")
+@throttled("yfinance")
+@retry_with_backoff(on_giveup=lambda exc: {})
+def get_company_info(ticker: str) -> Dict[str, Any]:
+    """
+    Company description, sector, and the valuation multiples Yahoo publishes.
+
+    `.info` is a fat, slow, occasionally-flaky endpoint, hence the 24h TTL.
+    """
+    if not YFINANCE_AVAILABLE:
+        return {}
+
+    ticker = normalize_ticker(ticker)
+    info = yf.Ticker(ticker).info or {}
+
+    if not info or info.get("regularMarketPrice") is None and len(info) < 5:
+        raise ValueError(f"Empty company info for {ticker}")
+
+    keys = [
+        "shortName", "longName", "sector", "industry", "country", "website",
+        "longBusinessSummary", "fullTimeEmployees", "currency", "exchange",
+        "marketCap", "enterpriseValue", "trailingPE", "forwardPE",
+        "priceToBook", "priceToSalesTrailing12Months", "enterpriseToEbitda",
+        "enterpriseToRevenue", "pegRatio", "beta", "dividendYield",
+        "payoutRatio", "profitMargins", "operatingMargins", "grossMargins",
+        "returnOnEquity", "returnOnAssets", "debtToEquity", "currentRatio",
+        "quickRatio", "totalRevenue", "revenueGrowth", "earningsGrowth",
+        "freeCashflow", "operatingCashflow", "totalCash", "totalDebt",
+        "trailingEps", "forwardEps", "bookValue", "sharesOutstanding",
+        "floatShares", "shortRatio", "shortPercentOfFloat",
+        "targetMeanPrice", "recommendationKey", "numberOfAnalystOpinions",
+        "fiftyTwoWeekHigh", "fiftyTwoWeekLow", "averageVolume",
+    ]
+    return {k: info.get(k) for k in keys if info.get(k) is not None}
+
+
+# ==========================================================================
+# FUNDAMENTALS - yfinance path
+# ==========================================================================
+@cached(ttl=config.TTL.fundamentals, namespace="equity_financials")
+@throttled("yfinance")
+@retry_with_backoff(on_giveup=lambda exc: {})
+def get_financial_statements(ticker: str, quarterly: bool = False) -> Dict[str, pd.DataFrame]:
+    """
+    Income statement, balance sheet and cash flow from Yahoo.
+
+    Fast and clean, but Yahoo only keeps ~4 annual / ~5 quarterly periods.
+    For deeper history use `get_sec_financials()`, which reads the XBRL facts
+    the company itself filed.
+    """
+    if not YFINANCE_AVAILABLE:
+        return {}
+
+    ticker = normalize_ticker(ticker)
+    tk = yf.Ticker(ticker)
+
+    if quarterly:
+        income, balance, cash = tk.quarterly_income_stmt, tk.quarterly_balance_sheet, tk.quarterly_cashflow
+    else:
+        income, balance, cash = tk.income_stmt, tk.balance_sheet, tk.cashflow
+
+    result = {
+        "income_statement": _clean_statement(income),
+        "balance_sheet": _clean_statement(balance),
+        "cash_flow": _clean_statement(cash),
+    }
+
+    if all(df.empty for df in result.values()):
+        raise ValueError(f"No financial statements available for {ticker}")
+    return result
+
+
+def _clean_statement(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Normalise a Yahoo statement frame: newest column first, no all-NaN rows."""
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    out = df.dropna(how="all")
+    try:
+        out = out[sorted(out.columns, reverse=True)]
+    except Exception:
+        pass
+    return out
+
+
+# ==========================================================================
+# SEC EDGAR
+# ==========================================================================
+def _sec_session():
+    """
+    Session preconfigured for SEC fair-access rules.
+
+    SEC requires a User-Agent identifying the requester with contact info.
+    Requests without one get a 403 and repeat offenders get IP-banned.
+    """
+    return get_session("sec", expire_after=config.TTL.sec_filings,
+                       user_agent=config.SEC_USER_AGENT)
+
+
+@cached(ttl=86400 * 7, namespace="sec_ticker_map")
+@throttled("sec")
+@retry_with_backoff(on_giveup=lambda exc: {})
+def get_sec_ticker_map() -> Dict[str, str]:
+    """
+    Ticker -> zero-padded 10-digit CIK.
+
+    The SEC publishes this as a single small JSON file; cached for a week
+    since new listings are rare.
+    """
+    resp = _sec_session().get(SEC_TICKER_MAP_URL,
+                              timeout=config.NET.request_timeout)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Shape: {"0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."}}
+    return {
+        str(row["ticker"]).upper(): str(row["cik_str"]).zfill(10)
+        for row in data.values()
+        if row.get("ticker")
+    }
+
+
+def ticker_to_cik(ticker: str) -> Optional[str]:
+    """Resolve a ticker to its SEC CIK, or None if it isn't a US registrant."""
+    mapping = get_sec_ticker_map()
+    return mapping.get(normalize_ticker(ticker).upper())
+
+
+@cached(ttl=config.TTL.sec_filings, namespace="sec_filings")
+@throttled("sec")
+@retry_with_backoff(on_giveup=lambda exc: pd.DataFrame())
+def get_sec_filings(
+    ticker: str,
+    form_types: Tuple[str, ...] = ("10-K", "10-Q", "8-K"),
+    limit: int = 40,
+) -> pd.DataFrame:
+    """
+    Recent EDGAR filings with direct document links.
+
+    Args:
+        form_types: Filter, e.g. ("10-K",) or ("4",) for insider transactions.
+                    Pass () for everything.
+        limit:      Max rows returned.
+
+    Returns:
+        DataFrame: form, filing_date, report_date, accession, description, url
+    """
+    cik = ticker_to_cik(ticker)
+    if not cik:
+        return pd.DataFrame()
+
+    resp = _sec_session().get(
+        SEC_SUBMISSIONS_URL.format(cik=cik), timeout=config.NET.request_timeout
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    recent = data.get("filings", {}).get("recent", {})
+    if not recent:
+        return pd.DataFrame()
+
+    df = pd.DataFrame({
+        "form": recent.get("form", []),
+        "filing_date": recent.get("filingDate", []),
+        "report_date": recent.get("reportDate", []),
+        "accession": recent.get("accessionNumber", []),
+        "primary_doc": recent.get("primaryDocument", []),
+        "description": recent.get("primaryDocDescription", []),
+    })
+    if df.empty:
+        return df
+
+    if form_types:
+        df = df[df["form"].isin(form_types)]
+
+    cik_int = str(int(cik))  # URL path uses the un-padded CIK
+    df["url"] = df.apply(
+        lambda r: (
+            f"https://www.sec.gov/Archives/edgar/data/{cik_int}/"
+            f"{str(r['accession']).replace('-', '')}/{r['primary_doc']}"
+        ),
+        axis=1,
+    )
+    df["filing_date"] = pd.to_datetime(df["filing_date"], errors="coerce")
+    df = df.sort_values("filing_date", ascending=False).head(limit)
+    df["company"] = data.get("name", ticker)
+    return df.reset_index(drop=True)
+
+
+# XBRL us-gaap tags per statement line.
+#
+# Order matters: entries are tried in sequence and MERGED per period, with
+# earlier tags winning for periods they cover. That ordering is why a filer
+# who migrated tags mid-history still gets a continuous series - see
+# _extract_xbrl_series. Put the tag carrying the most recent data first where
+# they conflict; put broader/legacy tags later as gap-fillers.
+#
+# Variants below were discovered empirically by scanning the companyfacts of
+# AAPL, MSFT, JPM, WMT and NVDA rather than guessed from the taxonomy.
+_XBRL_CONCEPTS: Dict[str, Dict[str, List[str]]] = {
+    "income_statement": {
+        "Revenue": ["RevenueFromContractWithCustomerExcludingAssessedTax",
+                    "RevenueFromContractWithCustomerIncludingAssessedTax",
+                    "Revenues", "SalesRevenueNet", "SalesRevenueGoodsNet",
+                    "SalesRevenueServicesNet"],
+        # MSFT: CostOfRevenue through FY2017, CostOfGoodsAndServicesSold after.
+        "Cost of Revenue": ["CostOfGoodsAndServicesSold", "CostOfRevenue",
+                            "CostOfGoodsSold", "CostOfServices", "CostOfSales"],
+        "Gross Profit": ["GrossProfit"],
+        "R&D Expense": ["ResearchAndDevelopmentExpense",
+                        "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost"],
+        "SG&A Expense": ["SellingGeneralAndAdministrativeExpense",
+                         "GeneralAndAdministrativeExpense",
+                         "SellingAndMarketingExpense"],
+        "Operating Income": ["OperatingIncomeLoss"],
+        # MSFT moved to InterestExpenseNonoperating from FY2023.
+        # NOTE: Apple stops disclosing interest expense entirely after FY2023
+        # (folded into "Other income/(expense), net") - no tag carries it.
+        # NaN in recent Apple columns is accurate, not a coverage gap.
+        "Interest Expense": ["InterestExpenseNonoperating", "InterestExpense",
+                             "InterestExpenseDebt",
+                             "InterestIncomeExpenseNet"],
+        "Pretax Income": ["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+                          "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
+                          "IncomeLossFromContinuingOperationsBeforeIncomeTaxesDomestic"],
+        "Income Tax": ["IncomeTaxExpenseBenefit"],
+        "Net Income": ["NetIncomeLoss", "ProfitLoss",
+                       "NetIncomeLossAvailableToCommonStockholdersBasic"],
+        "EPS Basic": ["EarningsPerShareBasic"],
+        "EPS Diluted": ["EarningsPerShareDiluted"],
+    },
+    "balance_sheet": {
+        "Cash & Equivalents": ["CashAndCashEquivalentsAtCarryingValue",
+                               "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"],
+        "Short-Term Investments": ["ShortTermInvestments",
+                                   "MarketableSecuritiesCurrent",
+                                   "AvailableForSaleSecuritiesDebtSecuritiesCurrent"],
+        "Accounts Receivable": ["AccountsReceivableNetCurrent",
+                                "ReceivablesNetCurrent",
+                                "AccountsAndOtherReceivablesNetCurrent"],
+        "Inventory": ["InventoryNet"],
+        "Total Current Assets": ["AssetsCurrent"],
+        "PP&E Net": ["PropertyPlantAndEquipmentNet"],
+        # Apple stopped disclosing goodwill separately after FY2017 (it is
+        # immaterial and folded into other assets). NaN there is correct.
+        "Goodwill": ["Goodwill"],
+        "Total Assets": ["Assets"],
+        "Accounts Payable": ["AccountsPayableCurrent",
+                             "AccountsPayableAndAccruedLiabilitiesCurrent"],
+        "Total Current Liabilities": ["LiabilitiesCurrent"],
+        "Long-Term Debt": ["LongTermDebtNoncurrent", "LongTermDebt",
+                           "LongTermDebtAndCapitalLeaseObligations"],
+        "Total Liabilities": ["Liabilities"],
+        "Retained Earnings": ["RetainedEarningsAccumulatedDeficit"],
+        "Total Equity": ["StockholdersEquity",
+                         "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],
+    },
+    "cash_flow": {
+        "Operating Cash Flow": ["NetCashProvidedByUsedInOperatingActivities",
+                                "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"],
+        "CapEx": ["PaymentsToAcquirePropertyPlantAndEquipment",
+                  "PaymentsToAcquireProductiveAssets"],
+        "Investing Cash Flow": ["NetCashProvidedByUsedInInvestingActivities",
+                                "NetCashProvidedByUsedInInvestingActivitiesContinuingOperations"],
+        "Financing Cash Flow": ["NetCashProvidedByUsedInFinancingActivities",
+                                "NetCashProvidedByUsedInFinancingActivitiesContinuingOperations"],
+        # AAPL/NVDA use PaymentsOfDividends recently; the CommonStock variant
+        # only covers older years. Merging keeps both eras.
+        "Dividends Paid": ["PaymentsOfDividends", "PaymentsOfDividendsCommonStock",
+                           "PaymentsOfDistributionsToAffiliates"],
+        "Buybacks": ["PaymentsForRepurchaseOfCommonStock",
+                     "PaymentsForRepurchaseOfEquity"],
+        # DELIBERATELY combined-only. Microsoft publishes no aggregate D&A
+        # tag - it reports `Depreciation` and `AmortizationOfIntangibleAssets`
+        # separately. Do NOT add those as fallbacks: a depreciation-only
+        # figure rendered under a "Depreciation & Amortization" heading is an
+        # understated number that looks authoritative, which is worse than a
+        # blank. Leaving it NaN is the honest result.
+        "Depreciation & Amortization": ["DepreciationDepletionAndAmortization",
+                                        "DepreciationAmortizationAndAccretionNet",
+                                        "DepreciationAndAmortization"],
+    },
+}
+
+
+@cached(ttl=config.TTL.fundamentals, namespace="sec_facts")
+@throttled("sec")
+@retry_with_backoff(on_giveup=lambda exc: {})
+def get_sec_company_facts(ticker: str) -> Dict[str, Any]:
+    """
+    Raw XBRL company facts - every numeric value the company ever tagged.
+
+    This is a large document (multi-MB for a mature filer), which is why it
+    gets a 24h TTL and a dedicated HTTP cache.
+    """
+    cik = ticker_to_cik(ticker)
+    if not cik:
+        return {}
+
+    resp = _sec_session().get(
+        SEC_COMPANYFACTS_URL.format(cik=cik), timeout=45
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def get_sec_financials(
+    ticker: str,
+    statement: str = "income_statement",
+    annual: bool = True,
+    periods: int = 8,
+) -> pd.DataFrame:
+    """
+    As-reported financial statements built from SEC XBRL facts.
+
+    This is the "scrape EDGAR instead of paying for an API" path. It reads
+    the structured facts the registrant filed, so the numbers tie exactly to
+    the 10-K/10-Q - no vendor normalisation in between.
+
+    Args:
+        statement: income_statement | balance_sheet | cash_flow
+        annual:    True -> FY figures (10-K). False -> quarterly (10-Q).
+        periods:   How many periods (columns) to return, newest first.
+
+    Returns:
+        DataFrame with line items as the index and fiscal periods as columns.
+        Empty if the filer isn't a US registrant or has no matching tags.
+    """
+    facts = get_sec_company_facts(ticker)
+    if not facts:
+        return pd.DataFrame()
+
+    us_gaap = facts.get("facts", {}).get("us-gaap", {})
+    if not us_gaap:
+        # The CIK resolved but carries no us-gaap taxonomy. This is not
+        # necessarily an error: after a corporate reorganisation the ticker
+        # is reassigned to a newly-registered holding entity that has not
+        # filed a 10-K yet, while the financial history stays under the
+        # predecessor CIK. XOM currently maps to "ExxonMobil Holdings Corp"
+        # (CIK 2115436), which reports only an `ffd` taxonomy.
+        available = list(facts.get("facts", {}))
+        log.info(
+            "%s (CIK %s, %s) has no us-gaap facts; taxonomies present: %s",
+            ticker, facts.get("cik"), facts.get("entityName"), available or "none",
+        )
+        empty = pd.DataFrame()
+        empty.attrs["reason"] = (
+            f"{facts.get('entityName', ticker)} has filed no XBRL financial "
+            f"statements under this CIK. The ticker may have been reassigned "
+            f"to a new registrant after a reorganisation, with the history "
+            f"remaining under the predecessor entity. Use the Yahoo Finance "
+            f"source for this name."
+        )
+        return empty
+
+    concepts = _XBRL_CONCEPTS.get(statement, {})
+    rows: Dict[str, Dict[str, float]] = {}
+
+    for label, tags in concepts.items():
+        series = _extract_xbrl_series(us_gaap, tags, annual=annual)
+        if series:
+            rows[label] = series
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows).T
+
+    # Sort period columns newest-first and trim.
+    try:
+        ordered = sorted(df.columns, key=lambda c: str(c), reverse=True)
+        df = df[ordered[:periods]]
+    except Exception:
+        df = df.iloc[:, :periods]
+
+    # Preserve the canonical line-item order rather than dict/DataFrame order.
+    df = df.reindex([k for k in concepts if k in df.index])
+    return df
+
+
+def _period_label(end: str, annual: bool) -> Optional[str]:
+    """Label a fact by its own period-end date: 'FY2025' or '2025Q3'."""
+    try:
+        stamp = pd.Timestamp(end)
+    except Exception:
+        return None
+    return f"FY{stamp.year}" if annual else f"{stamp.year}Q{stamp.quarter}"
+
+
+def _facts_for_tag(
+    node: Optional[Dict[str, Any]], annual: bool
+) -> Dict[str, Tuple[str, float]]:
+    """
+    Extract one tag's periods. Returns {period: (filed_date, value)}.
+
+    The `filed` date is carried out so the caller can break ties between
+    tags as well as within one.
+    """
+    if not node:
+        return {}
+
+    # Prefer USD; fall back to whatever single unit exists (EPS is USD/shares).
+    units = node.get("units", {})
+    unit_key = "USD" if "USD" in units else next(iter(units), None)
+    if not unit_key:
+        return {}
+
+    wanted_form = "10-K" if annual else "10-Q"
+    out: Dict[str, Tuple[str, float]] = {}
+
+    for fact in units[unit_key]:
+        val = fact.get("val")
+        end = fact.get("end")
+        if val is None or not end:
+            continue
+        if not str(fact.get("form", "")).startswith(wanted_form):
+            continue
+
+        start = fact.get("start")
+        if start:
+            try:
+                days = (pd.Timestamp(end) - pd.Timestamp(start)).days
+            except Exception:
+                continue
+            # ~1 year vs ~1 quarter, with slack for 52/53-week calendars.
+            if annual and not (330 <= days <= 400):
+                continue
+            if not annual and not (60 <= days <= 115):
+                continue
+
+        period = _period_label(end, annual)
+        if period is None:
+            continue
+
+        filed = str(fact.get("filed", ""))
+        existing = out.get(period)
+        # Within a tag, the most recently filed value is the restated one.
+        if existing is None or filed > existing[0]:
+            out[period] = (filed, float(val))
+
+    return out
+
+
+def _extract_xbrl_series(
+    us_gaap: Dict[str, Any], tags: List[str], annual: bool
+) -> Dict[str, float]:
+    """
+    Pull one concept's time series out of the companyfacts blob.
+
+    CRITICAL SUBTLETY - do not "simplify" this back to using `fy`/`fp`:
+
+    In companyfacts, a fact's `fy`/`fp` identify the *report the fact appeared
+    in*, NOT the period the number describes. Apple's FY2023 revenue appears
+    three times - tagged fy=2023 (its own 10-K), fy=2024 and fy=2025 (as prior
+    -year comparatives). Keying on `fy` and keeping the latest filing there-
+    fore labels FY2023 revenue as "FY2025", shifting the entire statement by
+    two years. Verified against Apple: real FY2025 revenue is $416.161B, but
+    the `fy`-keyed version reported $383.285B (the FY2023 figure) under that
+    heading.
+
+    So periods are derived from each fact's own `end` date, and facts are
+    selected by duration:
+      * Duration facts (income statement, cash flow) carry `start`+`end`;
+        we keep spans matching the requested periodicity so a 10-K's annual
+        and quarterly tags for the same concept don't collide.
+      * Instant facts (balance sheet) carry only `end` and are dated by it.
+
+    Deduplication still keeps the most recently *filed* value for a given
+    period, which is what correctly surfaces restatements.
+
+    SECOND SUBTLETY - tags are MERGED, not first-match-wins:
+
+    Filers migrate between tags mid-history. Microsoft reported cost of
+    revenue under `CostOfRevenue` through FY2017 and `CostOfGoodsAndServices
+    Sold` from FY2020. Apple used `PaymentsOfDividendsCommonStock` in
+    FY2016-17 and `PaymentsOfDividends` from FY2020. Returning on the first
+    tag that yields *any* data therefore produced a decade-old series and
+    left every recent column NaN - the line item looked simply unavailable.
+
+    So every tag is read and results are merged per period, with earlier
+    entries in `tags` taking precedence for periods they actually cover.
+    """
+    merged: Dict[str, Tuple[str, float]] = {}
+
+    for tag in tags:  # priority order
+        for period, (filed, value) in _facts_for_tag(us_gaap.get(tag), annual).items():
+            # A higher-priority tag already covered this period - keep it.
+            if period not in merged:
+                merged[period] = (filed, value)
+
+    return {period: value for period, (_, value) in merged.items()}
+
+
+# ==========================================================================
+# PEER COMPARISON / RELATIVE VALUE
+# ==========================================================================
+def get_peer_comparison(tickers: List[str]) -> pd.DataFrame:
+    """
+    Valuation comparables table (Bloomberg RV equivalent).
+
+    Computes P/E, EV/EBITDA, Debt/Equity, P/B, P/S, margins and returns for
+    each name. Missing metrics come back as NaN rather than dropping the row -
+    a peer with no EBITDA is still worth seeing on the sheet.
+
+    Args:
+        tickers: Symbols to compare. Keep it under ~10; each costs a request.
+    """
+    records: List[Dict[str, Any]] = []
+
+    for ticker in tickers:
+        ticker = normalize_ticker(ticker)
+        try:
+            info = get_company_info(ticker)
+            if not info:
+                continue
+
+            market_cap = _safe_float(info.get("marketCap"))
+            ev = _safe_float(info.get("enterpriseValue"))
+            total_debt = _safe_float(info.get("totalDebt"))
+            equity = _safe_float(info.get("bookValue"))
+            shares = _safe_float(info.get("sharesOutstanding"))
+
+            # yfinance reports debtToEquity as a percentage (e.g. 145.0 = 1.45x).
+            d_to_e = _safe_float(info.get("debtToEquity"))
+            if d_to_e is not None:
+                d_to_e = d_to_e / 100.0
+            elif total_debt is not None and equity and shares:
+                d_to_e = total_debt / (equity * shares)
+
+            records.append({
+                "Ticker": ticker,
+                "Name": (info.get("shortName") or ticker)[:28],
+                "Sector": info.get("sector") or "-",
+                "Mkt Cap": market_cap,
+                "EV": ev,
+                "P/E (TTM)": _safe_float(info.get("trailingPE")),
+                "P/E (Fwd)": _safe_float(info.get("forwardPE")),
+                "PEG": _safe_float(info.get("pegRatio")),
+                "P/B": _safe_float(info.get("priceToBook")),
+                "P/S": _safe_float(info.get("priceToSalesTrailing12Months")),
+                "EV/EBITDA": _safe_float(info.get("enterpriseToEbitda")),
+                "EV/Rev": _safe_float(info.get("enterpriseToRevenue")),
+                "Debt/Equity": d_to_e,
+                "Curr Ratio": _safe_float(info.get("currentRatio")),
+                "Gross Mgn %": _pct(info.get("grossMargins")),
+                "Oper Mgn %": _pct(info.get("operatingMargins")),
+                "Net Mgn %": _pct(info.get("profitMargins")),
+                "ROE %": _pct(info.get("returnOnEquity")),
+                "Rev Growth %": _pct(info.get("revenueGrowth")),
+                "Div Yield %": _pct(info.get("dividendYield")),
+                "Beta": _safe_float(info.get("beta")),
+            })
+        except Exception as exc:
+            log.warning("Peer fetch failed for %s: %s", ticker, exc)
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+
+    # Append a peer-median row so the user can eyeball rich vs cheap instantly.
+    numeric = df.select_dtypes(include=[np.number])
+    if not numeric.empty:
+        median = numeric.median(numeric_only=True)
+        median_row = {c: np.nan for c in df.columns}
+        median_row.update(median.to_dict())
+        median_row["Ticker"] = "— MEDIAN —"
+        median_row["Name"] = "Peer group median"
+        median_row["Sector"] = ""
+        df = pd.concat([df, pd.DataFrame([median_row])], ignore_index=True)
+
+    return df
+
+
+def suggest_peers(ticker: str, max_peers: int = 6) -> List[str]:
+    """
+    Pick a reasonable peer set: the configured group containing the ticker,
+    else other names in the same sector from the configured groups.
+    """
+    ticker = normalize_ticker(ticker).upper()
+
+    for members in config.PEER_GROUPS.values():
+        if ticker in members:
+            peers = [t for t in members if t != ticker]
+            return [ticker] + peers[: max_peers - 1]
+
+    # Not in a preset group: match on sector via the company profile.
+    try:
+        sector = (get_company_info(ticker) or {}).get("sector")
+        if sector:
+            for members in config.PEER_GROUPS.values():
+                probe = get_company_info(members[0]) or {}
+                if probe.get("sector") == sector:
+                    return [ticker] + members[: max_peers - 1]
+    except Exception:
+        pass
+
+    return [ticker] + config.PEER_GROUPS["megacap_tech"][: max_peers - 1]
+
+
+# ==========================================================================
+# OPTIONS
+# ==========================================================================
+@cached(ttl=config.TTL.intraday, namespace="equity_options")
+@throttled("yfinance")
+@retry_with_backoff(on_giveup=lambda exc: {})
+def get_options_chain(ticker: str, expiry: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Options chain for one expiry, plus a put/call ratio.
+
+    Args:
+        expiry: "YYYY-MM-DD". Defaults to the nearest listed expiry.
+    """
+    if not YFINANCE_AVAILABLE:
+        return {}
+
+    ticker = normalize_ticker(ticker)
+    tk = yf.Ticker(ticker)
+
+    expiries = list(tk.options or [])
+    if not expiries:
+        return {}
+
+    chosen = expiry if expiry in expiries else expiries[0]
+    chain = tk.option_chain(chosen)
+
+    calls = chain.calls.copy() if chain.calls is not None else pd.DataFrame()
+    puts = chain.puts.copy() if chain.puts is not None else pd.DataFrame()
+
+    call_oi = float(calls["openInterest"].fillna(0).sum()) if "openInterest" in calls else 0.0
+    put_oi = float(puts["openInterest"].fillna(0).sum()) if "openInterest" in puts else 0.0
+
+    return {
+        "expiries": expiries,
+        "selected_expiry": chosen,
+        "calls": calls,
+        "puts": puts,
+        "call_open_interest": call_oi,
+        "put_open_interest": put_oi,
+        "put_call_ratio": (put_oi / call_oi) if call_oi else None,
+    }
+
+
+# ==========================================================================
+# HELPERS
+# ==========================================================================
+def normalize_ticker(ticker: str) -> str:
+    """
+    Coerce user input into a Yahoo-compatible symbol.
+
+    Handles the common cases: whitespace, lowercase, Bloomberg-style
+    "AAPL US Equity", and the class-share dot/dash mismatch (BRK.B -> BRK-B).
+    """
+    if not ticker:
+        return ""
+
+    t = str(ticker).strip().upper()
+
+    # "AAPL US EQUITY" / "VOD LN EQUITY" -> take the root symbol.
+    parts = t.split()
+    if len(parts) > 1 and parts[-1] in {"EQUITY", "INDEX", "COMDTY", "CURNCY"}:
+        t = parts[0]
+    elif len(parts) > 1:
+        t = parts[0]
+
+    # Yahoo uses '-' for share classes; users type '.'. But leave real
+    # suffixes alone (.TO, .L, .HK, ...) - those are exchange codes.
+    if "." in t:
+        root, _, suffix = t.rpartition(".")
+        if len(suffix) == 1 and suffix.isalpha():
+            t = f"{root}-{suffix}"
+
+    return t
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    """float() that returns None for None/NaN/inf/non-numeric instead of raising."""
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(out) or math.isinf(out):
+        return None
+    return out
+
+
+def _pct(value: Any) -> Optional[float]:
+    """Convert a 0-1 ratio to a percentage, tolerating None/NaN."""
+    val = _safe_float(value)
+    return None if val is None else val * 100.0
+
+
+def format_large_number(value: Optional[float], currency: str = "$") -> str:
+    """1.234e9 -> '$1.23B'. Used across every metric tile in the UI."""
+    val = _safe_float(value)
+    if val is None:
+        return "—"
+
+    sign = "-" if val < 0 else ""
+    val = abs(val)
+
+    for threshold, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if val >= threshold:
+            return f"{sign}{currency}{val / threshold:.2f}{suffix}"
+    return f"{sign}{currency}{val:,.2f}"
+
+
+__all__ = [
+    "get_history", "get_quote", "get_quotes_batch",
+    "add_indicators", "summarize_technicals",
+    "ema", "sma", "rsi", "macd", "bollinger", "atr", "vwap",
+    "get_company_info", "get_financial_statements",
+    "get_sec_filings", "get_sec_financials", "get_sec_company_facts",
+    "ticker_to_cik", "get_peer_comparison", "suggest_peers",
+    "get_options_chain", "normalize_ticker", "format_large_number",
+    "YFINANCE_AVAILABLE", "OPENBB_AVAILABLE",
+]

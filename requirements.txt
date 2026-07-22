@@ -1,0 +1,53 @@
+# ============================================================================
+# OPEN-TERMINAL :: Free Bloomberg Terminal Alternative
+# All dependencies are free / open-source. No paid data subscriptions.
+# Install:  pip install -r requirements.txt
+#           playwright install chromium      (one-time browser download)
+# ============================================================================
+
+# --- Core app / UI ---------------------------------------------------------
+streamlit>=1.40.0
+plotly>=5.24.0
+pandas>=2.2.0
+numpy>=1.26.0
+
+# --- Market data -----------------------------------------------------------
+yfinance>=0.2.50            # Equities, ETFs, FX, futures (15-min delayed)
+curl_cffi>=0.7.0            # TLS impersonation backend used by modern yfinance
+
+# --- Macro -----------------------------------------------------------------
+fredapi>=0.5.2              # FRED (free API key). Falls back to keyless CSV.
+
+# --- Crypto / FX -----------------------------------------------------------
+ccxt>=4.4.0                 # Unified exchange API (public endpoints only)
+
+# --- OSINT: news -----------------------------------------------------------
+feedparser>=6.0.11          # RSS/Atom parsing
+nltk>=3.9                   # VADER sentiment (lexicon downloaded at runtime)
+beautifulsoup4>=4.12.0
+lxml>=5.3.0
+
+# --- OSINT: maritime -------------------------------------------------------
+pyais>=2.6.0                # NMEA/AIS message decoding (UDP/TCP/serial feeds)
+websockets>=13.0            # aisstream.io free websocket firehose
+
+# --- Scraping --------------------------------------------------------------
+requests>=2.32.0
+requests-cache>=1.2.0       # Transparent HTTP caching -> SQLite
+playwright>=1.48.0          # Headless browser for JS-rendered public pages
+
+# --- Maps ------------------------------------------------------------------
+folium>=0.18.0
+streamlit-folium>=0.23.0
+
+# --- Utilities -------------------------------------------------------------
+python-dotenv>=1.0.1
+pytz>=2024.2
+
+# ============================================================================
+# OPTIONAL EXTRAS - install manually if you want them, they are heavy.
+# ============================================================================
+# openbb>=4.3.0             # Full OpenBB SDK (~1GB of transitive deps).
+#                           # Open-Terminal auto-detects it if present.
+# transformers>=4.45.0      # FinBERT financial sentiment (needs torch)
+# torch>=2.4.0              # ~2.5GB. VADER is the default, no torch needed.
