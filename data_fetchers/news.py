@@ -56,6 +56,7 @@ except ImportError:
 # SENTIMENT ENGINES
 # ==========================================================================
 _vader_analyzer: Optional[Any] = None
+_vader_checked = False
 _finbert_pipeline: Optional[Any] = None
 _finbert_checked = False
 
@@ -65,10 +66,16 @@ def _get_vader():
     Lazily build the VADER analyser with the finance lexicon merged in.
 
     Downloads the ~1MB lexicon on first use if NLTK doesn't already have it.
+
+    The failure is cached as well as the success. Without that, a corrupt or
+    unreachable lexicon made every scored headline re-attempt the download -
+    and with NLTK's server returning 429 that turned one news panel into
+    dozens of sequential network timeouts, hanging the whole page.
     """
-    global _vader_analyzer
-    if _vader_analyzer is not None:
+    global _vader_analyzer, _vader_checked
+    if _vader_checked:
         return _vader_analyzer
+    _vader_checked = True
 
     try:
         from nltk.sentiment.vader import SentimentIntensityAnalyzer

@@ -296,6 +296,8 @@ _DEFAULT_BUDGETS: Dict[str, Tuple[float, float]] = {
     "rss":           (3.0, 6.0),
     "scrape":        (0.3, 2.0),    # Headless browser targets: be gentle.
     "coingecko":     (0.4, 2.0),    # Free tier ~10-30/min.
+    "wikidata":      (1.0, 3.0),    # No published cap; their docs ask for
+                                    # serial-ish access and a real UA.
     "default":       (2.0, 4.0),
 }
 

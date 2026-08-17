@@ -728,6 +728,249 @@ def render_chart(fig: go.Figure, key: Optional[str] = None) -> None:
 
 
 # ==========================================================================
+# PEOPLE
+# ==========================================================================
+# Platform -> (glyph, accent). Text glyphs rather than icon fonts: the theme
+# overrides font-family globally and a webfont icon would render as its own
+# ligature name.
+_SOCIAL_STYLE: Dict[str, Tuple[str, str]] = {
+    "twitter": ("X", THEME.white),
+    "linkedin": ("in", THEME.cyan),
+    "facebook": ("f", THEME.cyan),
+    "instagram": ("IG", THEME.magenta),
+    "youtube": ("YT", THEME.red),
+    "tiktok": ("TT", THEME.magenta),
+    "mastodon": ("M", THEME.cyan),
+    "website": ("WWW", THEME.amber),
+    "wikidata": ("WD", THEME.muted),
+}
+
+
+def social_links(social: Dict[str, Any], size: int = 11) -> str:
+    """
+    Row of social handles as linked pills. Returns HTML.
+
+    `social` is {platform: {"handle": ..., "url": ...}} as produced by
+    company_intel. Unknown platforms are rendered with their own name.
+    """
+    if not social:
+        return (f'<span style="color:{THEME.muted};font-size:{size}px;">'
+                f'no verified accounts</span>')
+
+    parts = []
+    for platform, entry in social.items():
+        if not isinstance(entry, dict):
+            continue
+        url = entry.get("url")
+        # str(), not truthiness: a missing value arriving from a DataFrame is
+        # NaN, and NaN is truthy - it reached .startswith() and crashed the
+        # whole page with "'float' object has no attribute 'startswith'".
+        if url is None or not isinstance(url, str) or not url.strip():
+            continue
+
+        glyph, color = _SOCIAL_STYLE.get(platform, (platform.upper()[:3], THEME.cyan))
+        raw_handle = entry.get("handle")
+        handle = raw_handle if isinstance(raw_handle, str) else ""
+        if platform == "website":
+            label = "site"
+        elif handle.startswith("http") or not handle:
+            label = platform
+        else:
+            label = handle[:26]
+        parts.append(
+            f'<a href="{html.escape(entry["url"])}" target="_blank" '
+            f'style="display:inline-block;border:1px solid {THEME.border};'
+            f'padding:1px 6px;margin:2px 4px 2px 0;font-size:{size}px;'
+            f'color:{color} !important;text-decoration:none;">'
+            f'<b>{html.escape(glyph)}</b>&nbsp;'
+            f'<span style="color:{THEME.muted};">{html.escape(label)}</span></a>'
+        )
+
+    return "".join(parts) or (
+        f'<span style="color:{THEME.muted};font-size:{size}px;">'
+        f'no verified accounts</span>')
+
+
+def executive_card(row: pd.Series, currency: str = "$") -> str:
+    """One executive as a bordered card. Returns HTML."""
+    name = html.escape(str(row.get("name") or "—"))
+    title = html.escape(str(row.get("title") or ""))
+
+    age = row.get("age")
+    age_text = f"age {int(age)}" if pd.notna(age) else ""
+
+    pay = row.get("total_pay")
+    if pd.notna(pay) and pay:
+        pay_text = f"{currency}{pay / 1e6:,.2f}M"
+        pay_color = THEME.amber
+    else:
+        pay_text = "not disclosed"
+        pay_color = THEME.muted
+
+    # Every field here can arrive as NaN from the officers DataFrame, so each
+    # is tested with pd.notna rather than for truthiness.
+    def _value(column: str) -> Optional[str]:
+        value = row.get(column)
+        return str(value) if value is not None and pd.notna(value) else None
+
+    social: Dict[str, Any] = {}
+    if _value("twitter"):
+        social["twitter"] = {"handle": _value("twitter_handle") or "profile",
+                             "url": _value("twitter")}
+    if _value("linkedin"):
+        social["linkedin"] = {"handle": "profile", "url": _value("linkedin")}
+    if _value("wikidata_url"):
+        social["wikidata"] = {"handle": "entity", "url": _value("wikidata_url")}
+
+    bio = _value("bio")
+    bio_html = (f'<div style="color:{THEME.muted};font-size:9px;margin-top:2px;">'
+                f'{html.escape(bio[:90])}</div>') if bio else ""
+
+    return (
+        f'<div style="border:1px solid {THEME.border};border-left:3px solid '
+        f'{THEME.amber};padding:7px 9px;margin-bottom:6px;background:{THEME.bg_panel};">'
+        f'<div style="display:flex;justify-content:space-between;align-items:baseline;">'
+        f'<span style="color:{THEME.white};font-size:13px;font-weight:700;">{name}</span>'
+        f'<span style="color:{pay_color};font-size:11px;">{pay_text}</span>'
+        f'</div>'
+        f'<div style="color:{THEME.cyan};font-size:10px;">{title}'
+        f'<span style="color:{THEME.muted};"> {("· " + age_text) if age_text else ""}</span>'
+        f'</div>'
+        f'{bio_html}'
+        f'<div style="margin-top:4px;">{social_links(social, size=10)}</div>'
+        f'</div>'
+    )
+
+
+# ==========================================================================
+# SUPPLY CHAIN NETWORK
+# ==========================================================================
+_TIER_STYLE: Dict[str, Tuple[float, str, str]] = {
+    # tier: (x position, colour, label)
+    "upstream": (-1.0, THEME.cyan, "SUPPLIER"),
+    "focal": (0.0, THEME.amber, "FOCAL"),
+    "downstream": (1.0, THEME.green, "CUSTOMER"),
+    "peer": (0.0, THEME.magenta, "COMPETITOR"),
+}
+
+
+def supply_chain_graph(network: Dict[str, Any], height: int = 560) -> go.Figure:
+    """
+    Three-column flow diagram: suppliers -> company -> customers, with
+    competitors ranged below the focal node.
+
+    A deliberate layout choice over a force-directed graph: supply chains have
+    an inherent direction, and a spring layout hides it. Node size encodes the
+    disclosed percentage; a dashed outline marks a counterparty the issuer
+    declined to name.
+    """
+    nodes = network.get("nodes", [])
+    edges = network.get("edges", [])
+
+    if not nodes:
+        fig = go.Figure()
+        return style_figure(fig, height=height, title="NO NETWORK DATA")
+
+    # ---- position every node ---------------------------------------------
+    by_tier: Dict[str, List[Dict[str, Any]]] = {}
+    for node in nodes:
+        by_tier.setdefault(node.get("tier", "peer"), []).append(node)
+
+    positions: Dict[str, Tuple[float, float]] = {}
+    for tier, members in by_tier.items():
+        x_base = _TIER_STYLE.get(tier, _TIER_STYLE["peer"])[0]
+        count = len(members)
+        for index, node in enumerate(members):
+            if tier == "focal":
+                y = 0.0
+            elif tier == "peer":
+                # Competitors fan out below the focal company.
+                y = -1.6 - index * 0.42
+                x_base = 0.0
+            else:
+                y = (index - (count - 1) / 2) * 0.75
+            positions[node["id"]] = (x_base, y)
+
+    # ---- edges ------------------------------------------------------------
+    traces: List[go.Scatter] = []
+    for edge in edges:
+        start = positions.get(edge["source"])
+        end = positions.get(edge["target"])
+        if not start or not end:
+            continue
+        competitor = edge.get("kind") == "competitor"
+        weight = edge.get("weight") or 0
+        traces.append(go.Scatter(
+            x=[start[0], end[0]], y=[start[1], end[1]],
+            mode="lines",
+            line=dict(
+                color=THEME.magenta if competitor else (
+                    THEME.grid if not edge.get("named") else THEME.amber),
+                width=1.0 if competitor else max(1.0, min(6.0, weight / 12 + 1)),
+                dash="dot" if competitor or not edge.get("named") else "solid",
+            ),
+            hoverinfo="skip", showlegend=False,
+        ))
+
+    # ---- nodes, one trace per tier so the legend is meaningful ------------
+    for tier, members in by_tier.items():
+        x_values, y_values, sizes, texts, hovers, lines = [], [], [], [], [], []
+        for node in members:
+            x, y = positions[node["id"]]
+            x_values.append(x)
+            y_values.append(y)
+            pct = node.get("pct")
+            sizes.append(20 if tier == "focal" else
+                         (14 + min(30, (pct or 0) * 0.45)))
+            label = node.get("label") or node["id"]
+            texts.append(str(label)[:22])
+            hover = f"<b>{label}</b><br>{_TIER_STYLE.get(tier, ('', '', tier))[2]}"
+            if pct:
+                hover += f"<br>{pct:.0f}% of revenue"
+            if not node.get("named", True):
+                hover += "<br><i>name withheld in filing</i>"
+            hovers.append(hover)
+            lines.append(1 if node.get("named", True) else 3)
+
+        color = _TIER_STYLE.get(tier, _TIER_STYLE["peer"])[1]
+        traces.append(go.Scatter(
+            x=x_values, y=y_values, mode="markers+text",
+            marker=dict(size=sizes, color=color, symbol="square",
+                        line=dict(color=THEME.bg, width=lines)),
+            text=texts,
+            textposition="middle right" if tier != "focal" else "top center",
+            textfont=dict(size=9, color=THEME.white),
+            hovertext=hovers, hoverinfo="text",
+            name=_TIER_STYLE.get(tier, ("", "", tier))[2],
+        ))
+
+    fig = go.Figure(traces)
+    fig.update_xaxes(visible=False, range=[-1.7, 2.0])
+    fig.update_yaxes(visible=False)
+    return style_figure(fig, height=height, title="", showlegend=True)
+
+
+def exposure_bars(df: pd.DataFrame, label_col: str, value_col: str,
+                  title: str = "", height: int = 300,
+                  suffix: str = "%") -> go.Figure:
+    """Horizontal bars for revenue-by-region / commodity-correlation panels."""
+    if df.empty:
+        return style_figure(go.Figure(), height=height, title=title)
+
+    frame = df.sort_values(value_col)
+    colors = [THEME.green if v >= 0 else THEME.red for v in frame[value_col]]
+
+    fig = go.Figure(go.Bar(
+        x=frame[value_col], y=frame[label_col], orientation="h",
+        marker=dict(color=colors),
+        text=[f"{v:,.1f}{suffix}" for v in frame[value_col]],
+        textposition="auto",
+        hovertemplate="%{y}: %{x:,.2f}" + suffix + "<extra></extra>",
+    ))
+    return style_figure(fig, height=height, title=title, showlegend=False)
+
+
+# ==========================================================================
 # HELPERS
 # ==========================================================================
 def _hex_to_rgb(hex_color: str) -> str:
@@ -744,4 +987,5 @@ __all__ = [
     "candlestick_chart", "line_chart", "sparkline", "heatmap", "gauge",
     "news_feed", "sentiment_bar",
     "styled_table", "statement_table", "status_bar", "render_chart",
+    "social_links", "executive_card", "supply_chain_graph", "exposure_bars",
 ]

@@ -583,6 +583,64 @@ def density_map(
     return _style_geo(fig, height, title)
 
 
+def exposure_map(
+    df: pd.DataFrame,
+    title: str = "REVENUE BY REPORTED GEOGRAPHY",
+    height: int = 380,
+) -> go.Figure:
+    """
+    Revenue exposure bubbles over a world map.
+
+    Expects the frame from supply_chain.get_geographic_revenue: region, revenue,
+    pct, lat, lon. Regions a filer reports as a residual ("Other countries",
+    "Rest of world") carry no meaningful location and are dropped rather than
+    pinned at (0, 0) in the Gulf of Guinea.
+    """
+    fig = go.Figure()
+
+    if df is None or df.empty:
+        fig.add_annotation(text="NO GEOGRAPHIC DISCLOSURE", showarrow=False,
+                           font=dict(color=THEME.muted, size=14))
+        return _style_geo(fig, height, title)
+
+    data = df.dropna(subset=["lat", "lon"])
+    data = data[(data["lat"] != 0) | (data["lon"] != 0)]
+    if data.empty:
+        fig.add_annotation(
+            text="ONLY UNLOCATABLE RESIDUAL REGIONS DISCLOSED",
+            showarrow=False, font=dict(color=THEME.muted, size=12))
+        return _style_geo(fig, height, title)
+
+    largest = float(data["pct"].max()) or 1.0
+    fig.add_trace(go.Scattergeo(
+        lat=data["lat"], lon=data["lon"],
+        text=[f"{row.region}<br>{row.pct:.1f}% of disclosed revenue"
+              for row in data.itertuples()],
+        hoverinfo="text",
+        marker=dict(
+            size=[14 + (pct / largest) * 46 for pct in data["pct"]],
+            color=data["pct"], colorscale=AMBER_SCALE,
+            line=dict(color=THEME.amber, width=1),
+            opacity=0.82,
+            colorbar=dict(title=dict(text="% REV",
+                                     font=dict(color=THEME.muted, size=9)),
+                          tickfont=dict(color=THEME.muted, size=9),
+                          thickness=10, len=0.6),
+        ),
+        name="REVENUE",
+    ))
+
+    fig.update_geos(
+        projection_type="natural earth",
+        bgcolor=THEME.bg, landcolor=THEME.bg_raised,
+        oceancolor=THEME.bg, showocean=True,
+        lakecolor=THEME.bg, coastlinecolor=THEME.border,
+        countrycolor=THEME.grid, showcountries=True, showland=True,
+    )
+    fig.update_layout(margin=dict(l=0, r=0, t=32, b=0), showlegend=False)
+    return _style_geo(fig, height, title)
+
+
 # ==========================================================================
 # HELPERS
 # ==========================================================================

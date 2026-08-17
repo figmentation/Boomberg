@@ -474,6 +474,9 @@ COMMAND_FUNCTIONS: Dict[str, str] = {
     # Equities
     "EQUITY": "equity", "EQ": "equity", "GP": "equity", "DES": "equity",
     "FA": "equity", "CN": "equity",
+    # Supply chain & counterparty risk
+    "SPLC": "supply_chain", "SUPPLY": "supply_chain", "SC": "supply_chain",
+    "SPLY": "supply_chain",
     # Maritime
     "SHIP": "maritime", "AIS": "maritime", "PORT": "maritime",
     # Aviation
@@ -491,6 +494,8 @@ COMMAND SYNTAX:  <SUBJECT> <FUNCTION>
 
   AAPL EQUITY      Equity analytics: chart, indicators, fundamentals, EDGAR
   NVDA GP          Same - GP is the Bloomberg price-graph mnemonic
+  AAPL SPLC        Supply chain: counterparties, geography, commodity, credit
+  SPLC             Supply chain for the ticker already loaded
   SUEZ SHIP        Maritime chokepoint monitor
   636019825 AIS    Track a specific vessel by MMSI (9 digits) or IMO
   FLY              Live global aircraft state vectors

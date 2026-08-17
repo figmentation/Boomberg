@@ -40,6 +40,7 @@ st.set_page_config(
 )
 
 from data_fetchers import aviation, equities, macro, maritime, news  # noqa: E402
+from data_fetchers import company_intel, supply_chain  # noqa: E402
 from ui import components as ui  # noqa: E402
 from ui import maps  # noqa: E402
 from ui.terminal_theme import THEME, apply_theme  # noqa: E402
@@ -192,7 +193,8 @@ def execute_command(raw: str) -> None:
         return
 
     module = parsed["module"]
-    if module == "equity":
+    if module in ("equity", "supply_chain"):
+        # Both modules key off the same ticker, so "NVDA SPLC" sets it too.
         st.session_state["ticker"] = equities.normalize_ticker(subject)
     elif module == "maritime":
         if subject in config.CHOKEPOINTS:
@@ -269,9 +271,9 @@ def render_command_bar() -> None:
 
     # Function-key style shortcuts.
     shortcuts = [
-        ("HOME", "home"), ("EQUITY", "equity"), ("SHIP", "maritime"),
-        ("FLY", "aviation"), ("MACRO", "macro"), ("NEWS", "news"),
-        ("HELP", "help"),
+        ("HOME", "home"), ("EQUITY", "equity"), ("SPLC", "supply_chain"),
+        ("SHIP", "maritime"), ("FLY", "aviation"), ("MACRO", "macro"),
+        ("NEWS", "news"), ("HELP", "help"),
     ]
     cols = st.columns(len(shortcuts))
     for col, (label, module) in zip(cols, shortcuts):
@@ -596,7 +598,8 @@ def page_equity() -> None:
     ui.quote_tiles(quote, info)
 
     tabs = st.tabs(["CHART", "FUNDAMENTALS", "SEC FILINGS",
-                    "PEER COMPARISON", "OPTIONS", "NEWS", "PROFILE"])
+                    "PEER COMPARISON", "OPTIONS", "NEWS", "PEOPLE",
+                    "SUPPLY CHAIN", "PROFILE"])
 
     # ---- CHART -----------------------------------------------------------
     with tabs[0]:
@@ -785,8 +788,29 @@ def page_equity() -> None:
             ], columns=4)
             ui.news_feed(ticker_news, max_rows=40)
 
-    # ---- PROFILE ---------------------------------------------------------
+    # ---- PEOPLE ----------------------------------------------------------
+    # Both of the tabs below are gated behind a button. Streamlit executes
+    # every tab body on every rerun, not just the visible one, so an eager
+    # fetch here would download a 10-K and issue a dozen Wikidata lookups
+    # each time anyone opened the equity page for a new ticker.
     with tabs[6]:
+        if _load_on_demand("people", ticker,
+                           "Fetch the executive roster and verified accounts"):
+            render_people(ticker, name, info)
+
+    # ---- SUPPLY CHAIN ----------------------------------------------------
+    with tabs[7]:
+        st.caption(
+            "A compact view. The full SPLC module — network map, geographic "
+            "exposure, commodity and credit risk — is one command away: "
+            "type SPLC, or the ticker followed by SPLC."
+        )
+        if _load_on_demand("splc", ticker,
+                           "Mine the latest 10-K for counterparty disclosures"):
+            render_supply_chain_summary(ticker)
+
+    # ---- PROFILE ---------------------------------------------------------
+    with tabs[8]:
         if not info:
             ui.alert("Company profile unavailable.", "warn")
         else:
@@ -824,6 +848,353 @@ def page_equity() -> None:
                         f'<span style="float:right;color:{THEME.cyan};">{display}</span></div>',
                         unsafe_allow_html=True,
                     )
+
+
+# ==========================================================================
+# PEOPLE  (management roster + verified social presence)
+# ==========================================================================
+def _load_on_demand(name: str, ticker: str, prompt: str) -> bool:
+    """
+    Gate an expensive tab behind one click, then remember the choice.
+
+    Streamlit has no server-side notion of which tab is visible - every tab
+    body runs on every rerun. Without this, opening the equity page would pay
+    for a 10-K download and a round of Wikidata lookups whether or not the
+    user ever looked at these tabs. Once loaded for a ticker it stays loaded,
+    so navigating away and back doesn't re-prompt.
+    """
+    key = f"_loaded_{name}_{ticker.upper()}"
+    if st.session_state.get(key):
+        return True
+
+    st.caption(f"{prompt}. Not loaded automatically — it costs a filing "
+               f"download and a few seconds.")
+    if st.button("LOAD", key=f"load_{name}_{ticker}", use_container_width=False):
+        st.session_state[key] = True
+        return True
+    return False
+
+
+def render_people(ticker: str, company_name: str, info: Dict[str, Any]) -> None:
+    """Executive roster with the compensation the proxy discloses."""
+    with st.spinner("Resolving officers and verified accounts…"):
+        officers = _safe(company_intel.get_executives, ticker,
+                         default=pd.DataFrame())
+        corporate = _safe(company_intel.get_company_social, ticker, company_name,
+                          default={})
+
+    # --- The company's own accounts ---------------------------------------
+    st.markdown("### CORPORATE ACCOUNTS")
+    if corporate.get("social"):
+        st.markdown(ui.social_links(corporate["social"], size=12),
+                    unsafe_allow_html=True)
+        if corporate.get("unverified"):
+            ui.alert(
+                "The matched Wikidata entity doesn't describe a company. These "
+                "handles may belong to a different subject of the same name.",
+                "warn",
+            )
+        if corporate.get("description"):
+            st.caption(corporate["description"])
+    else:
+        ui.alert(
+            "No verified social accounts found. Handles come from Wikidata's "
+            "curated properties rather than guesswork — an unmapped company "
+            "shows nothing here rather than a plausible-looking wrong link.",
+            "warn",
+        )
+
+    st.divider()
+
+    # --- Officers ----------------------------------------------------------
+    if officers.empty:
+        ui.alert(
+            f"No officer data for {ticker}. yfinance sources this from the "
+            f"DEF 14A proxy statement, which foreign private issuers "
+            f"(filing 20-F) and non-US listings do not file.", "warn",
+        )
+        return
+
+    summary = company_intel.compensation_summary(officers)
+    currency = info.get("currency", "USD")
+    symbol = "$" if currency in ("USD", "") else ""
+
+    ui.metric_row([
+        ui.metric_tile("OFFICERS", summary.get("officers"), value_format="{:,.0f}"),
+        ui.metric_tile("CEO PAY", (summary.get("ceo_pay") or 0) / 1e6,
+                       subtitle=f"{currency} millions", value_format="{:,.2f}"),
+        ui.metric_tile("MEDIAN PAY", (summary.get("median_comp") or 0) / 1e6,
+                       subtitle=f"{currency} millions", value_format="{:,.2f}"),
+        ui.metric_tile("CEO vs PEERS", summary.get("ceo_vs_peers"),
+                       subtitle="× median officer", value_format="{:,.2f}×",
+                       accent=THEME.red if (summary.get("ceo_vs_peers") or 0) > 4
+                       else THEME.amber),
+        ui.metric_tile("MEAN AGE", summary.get("mean_age"), value_format="{:,.0f}"),
+    ], columns=5)
+
+    st.caption(
+        "Compensation is the proxy's summary-table total for the last "
+        "reported fiscal year. 'CEO vs peers' compares the CEO to the median "
+        "of the other named officers — it is NOT the SEC's CEO-to-median-"
+        "employee pay ratio, which needs a figure yfinance doesn't carry."
+    )
+
+    left, right = st.columns(2)
+    for index, (_, row) in enumerate(officers.iterrows()):
+        with (left if index % 2 == 0 else right):
+            st.markdown(ui.executive_card(row, symbol), unsafe_allow_html=True)
+
+    with st.expander("ROSTER AS TABLE"):
+        columns = [c for c in ("name", "title", "age", "total_pay",
+                               "twitter_handle", "bio") if c in officers.columns]
+        st.dataframe(officers[columns], use_container_width=True, hide_index=True)
+
+
+# ==========================================================================
+# PAGE: SUPPLY CHAIN  (SPLC)
+# ==========================================================================
+def render_supply_chain_summary(ticker: str) -> None:
+    """The condensed panel embedded in the equity page's tab."""
+    counterparties = _safe(supply_chain.get_counterparties, ticker,
+                           default=pd.DataFrame())
+    if counterparties.empty:
+        ui.alert(
+            "No concentration disclosures found in the latest 10-K. US GAAP "
+            "only forces disclosure above 10% of revenue, so a diversified "
+            "issuer legitimately reports none.", "warn",
+        )
+        return
+
+    named = counterparties[counterparties["named"]]
+    single = counterparties[~counterparties["is_aggregate"]]
+    largest_single = single["pct_of_revenue"].max() if not single.empty else None
+
+    ui.metric_row([
+        ui.metric_tile("DISCLOSURES", len(counterparties), value_format="{:,.0f}"),
+        ui.metric_tile("NAMED", len(named), value_format="{:,.0f}",
+                       accent=THEME.green if len(named) else THEME.muted),
+        ui.metric_tile("LARGEST SINGLE", largest_single,
+                       subtitle="% of revenue", value_format="{:,.0f}%",
+                       accent=THEME.red if (largest_single or 0) >= 25
+                       else THEME.amber),
+    ], columns=3)
+
+    display = counterparties[["counterparty", "relationship",
+                              "pct_of_revenue", "named", "is_aggregate"]].copy()
+    ui.styled_table(display, height=260)
+
+
+def page_supply_chain() -> None:
+    ticker = st.session_state["ticker"]
+    ui.module_header("SUPPLY CHAIN ANALYSIS",
+                     "COUNTERPARTY · GEOGRAPHIC · COMMODITY · CREDIT EXPOSURE")
+
+    controls = st.columns([2, 1, 1])
+    with controls[0]:
+        entered = st.text_input("TICKER", value=ticker, key="splc_ticker").upper()
+        if entered and entered != ticker:
+            st.session_state["ticker"] = equities.normalize_ticker(entered)
+            st.rerun()
+    with controls[1]:
+        show_peers = st.checkbox("SHOW COMPETITORS", value=True)
+    with controls[2]:
+        st.write("")
+        if st.button("REBUILD", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+
+    st.markdown(
+        f'<div style="border-left:3px solid {THEME.amber};padding:6px 10px;'
+        f'background:{THEME.bg_panel};font-size:11px;color:{THEME.muted};'
+        f'margin-bottom:8px;">'
+        f'Every relationship below is mined from this issuer\'s own SEC '
+        f'filings and links back to the source document. Bloomberg\'s SPLC '
+        f'adds analyst-curated links and proprietary estimates for pairs '
+        f'nobody discloses — that layer is not reproducible from free data, '
+        f'so it is absent here rather than guessed at.</div>',
+        unsafe_allow_html=True,
+    )
+
+    with st.spinner("Mining filings and assembling the network…"):
+        network = _safe(supply_chain.build_network, ticker, show_peers, default={})
+        counterparties = _safe(supply_chain.get_counterparties, ticker,
+                               default=pd.DataFrame())
+
+    stats = network.get("stats", {}) if network else {}
+    verdict, explanation = supply_chain.concentration_verdict(stats)
+
+    top = stats.get("max_customer_pct") or 0
+    ui.alert(f"{verdict} — {explanation}",
+             "error" if top >= 50 else "warn" if top >= 25 else "ok")
+
+    ui.metric_row([
+        ui.metric_tile("COUNTERPARTIES", stats.get("counterparties"),
+                       value_format="{:,.0f}"),
+        ui.metric_tile("NAMED", stats.get("named"), value_format="{:,.0f}",
+                       subtitle="issuer identified them",
+                       accent=THEME.green if stats.get("named") else THEME.muted),
+        ui.metric_tile("CUSTOMERS", stats.get("customers"), value_format="{:,.0f}"),
+        ui.metric_tile("SUPPLIERS", stats.get("suppliers"), value_format="{:,.0f}"),
+        ui.metric_tile("COMPETITORS", stats.get("peers"), value_format="{:,.0f}"),
+        ui.metric_tile("TOP EXPOSURE", stats.get("max_customer_pct"),
+                       subtitle="% of revenue", value_format="{:,.0f}%",
+                       accent=THEME.red if top >= 25 else THEME.amber),
+    ], columns=6)
+
+    tabs = st.tabs(["NETWORK MAP", "COUNTERPARTY DETAIL", "GEOGRAPHIC EXPOSURE",
+                    "COMMODITY DEPENDENCY", "CREDIT RISK"])
+
+    # ---- NETWORK ---------------------------------------------------------
+    with tabs[0]:
+        if not network or not network.get("nodes"):
+            ui.alert("Nothing to map for this issuer.", "warn")
+        else:
+            ui.render_chart(ui.supply_chain_graph(network),
+                            key=f"splc_net_{ticker}")
+            st.caption(
+                "Node size scales with disclosed revenue share. A thick solid "
+                "edge is a named counterparty; a dotted edge is a disclosure "
+                "where the issuer withheld the name. Competitors are sector "
+                "peers, not a filed relationship."
+            )
+
+    # ---- COUNTERPARTIES --------------------------------------------------
+    with tabs[1]:
+        if counterparties.empty:
+            ui.alert(
+                "No concentration disclosure in the latest 10-K. Above 10% of "
+                "revenue a US issuer must disclose the exposure — but it is "
+                "not obliged to name the partner, and most decline.", "warn",
+            )
+        else:
+            for _, row in counterparties.iterrows():
+                accent = THEME.green if row["named"] else THEME.muted
+                tag = ui.badge(row["relationship"].upper(),
+                               "green" if row["relationship"] == "customer" else "cyan")
+                if row.get("is_aggregate"):
+                    tag += ui.badge("COMBINED GROUP", "cyan")
+                elif not row["named"]:
+                    tag += ui.badge("NAME WITHHELD", "muted")
+                # pd.notna, not truthiness: an unnamed row carries NaN here,
+                # and NaN is truthy - it rendered a badge reading "NAN".
+                if pd.notna(row["counterparty_ticker"]):
+                    tag += ui.badge(row["counterparty_ticker"], "amber")
+
+                st.markdown(
+                    f'<div style="border:1px solid {THEME.border};border-left:3px '
+                    f'solid {accent};padding:7px 10px;margin-bottom:6px;">'
+                    f'<div style="display:flex;justify-content:space-between;">'
+                    f'<span style="color:{THEME.white};font-size:13px;font-weight:700;">'
+                    f'{row["counterparty"]}</span>'
+                    f'<span style="color:{THEME.amber};font-size:14px;">'
+                    f'{row["pct_of_revenue"]:.0f}%</span></div>'
+                    f'<div style="margin:3px 0;">{tag}</div>'
+                    f'<div style="color:{THEME.muted};font-size:10px;'
+                    f'font-style:italic;">“{row["quote"]}”</div>'
+                    f'<a href="{row["source_url"]}" target="_blank" '
+                    f'style="font-size:9px;color:{THEME.cyan};">SOURCE FILING →</a>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+    # ---- GEOGRAPHY -------------------------------------------------------
+    with tabs[2]:
+        geography = _safe(supply_chain.get_geographic_revenue, ticker,
+                          default=pd.DataFrame())
+        if geography.empty:
+            ui.alert(
+                "This issuer doesn't break revenue out by geography in its "
+                "10-K. Some report only property and equipment by region, or "
+                "disaggregate by end market instead.", "warn",
+            )
+        else:
+            coverage = geography["coverage_pct"].iloc[0] \
+                if "coverage_pct" in geography.columns else None
+            if pd.notna(coverage) and coverage < 95:
+                ui.alert(
+                    f"These regions account for {coverage:.0f}% of "
+                    f"consolidated revenue — the issuer breaks out only its "
+                    f"largest markets, so shares below are of the disclosed "
+                    f"portion, not of total revenue.", "warn",
+                )
+
+            map_col, bar_col = st.columns([3, 2])
+            with map_col:
+                ui.render_chart(maps.exposure_map(geography),
+                                key=f"splc_geo_{ticker}")
+            with bar_col:
+                ui.render_chart(ui.exposure_bars(
+                    geography, "region", "pct", "SHARE OF DISCLOSED REVENUE",
+                    height=340))
+
+            ui.styled_table(
+                geography[["region", "revenue", "pct"]],
+                highlight_columns=["pct"], height=220,
+            )
+            st.caption(f"Source: {geography.iloc[0]['source']} — parsed from "
+                       f"the filing's XBRL.")
+
+    # ---- COMMODITY -------------------------------------------------------
+    with tabs[3]:
+        commodities = _safe(supply_chain.get_commodity_exposure, ticker,
+                            default=pd.DataFrame())
+        ui.alert(
+            "This is a statistical association, not a disclosed input cost. A "
+            "high correlation can mean the company sells the commodity, buys "
+            "it, or merely shares a demand cycle with it. Direction is not "
+            "identified here.", "warn",
+        )
+        if commodities.empty:
+            st.info("No commodity correlation above the 0.15 threshold.")
+        else:
+            ui.render_chart(ui.exposure_bars(
+                commodities, "commodity", "correlation",
+                "RETURN CORRELATION — 2Y DAILY", height=330, suffix=""))
+            ui.styled_table(
+                commodities[["commodity", "correlation", "beta",
+                             "r_squared", "observations"]],
+                highlight_columns=["correlation"], height=240,
+            )
+
+    # ---- CREDIT ----------------------------------------------------------
+    with tabs[4]:
+        credit = _safe(supply_chain.get_credit_risk, ticker, default={})
+        if not credit or credit.get("z_score") is None:
+            ui.alert(
+                credit.get("note", "Z-score unavailable.")
+                if credit else "Z-score unavailable.", "warn",
+            )
+        else:
+            z = credit["z_score"]
+            color = {"SAFE": THEME.green, "GREY": THEME.amber,
+                     "DISTRESS": THEME.red}.get(credit["band"], THEME.muted)
+            ui.metric_row([
+                ui.metric_tile("ALTMAN Z", z, value_format="{:,.2f}",
+                               subtitle=credit["band"], accent=color),
+                ui.metric_tile("DEFAULT RISK", credit["risk"], accent=color),
+                ui.metric_tile("MODEL FIT", credit["model_fit"],
+                               subtitle=credit.get("sector", ""),
+                               accent=THEME.amber
+                               if credit["model_fit"] == "POOR" else THEME.green),
+            ], columns=3)
+
+            if credit["model_fit"] == "POOR":
+                ui.alert(credit["note"], "warn")
+
+            components = pd.DataFrame(
+                [{"component": key.replace("_", " ").title(), "value": value}
+                 for key, value in credit["components"].items()
+                 if value is not None])
+            if not components.empty:
+                ui.render_chart(ui.exposure_bars(
+                    components, "component", "value",
+                    "Z-SCORE COMPONENTS", height=280, suffix=""))
+            st.caption(
+                "Z = 1.2·WC/TA + 1.4·RE/TA + 3.3·EBIT/TA + 0.6·MVE/TL + "
+                "1.0·Sales/TA. Above 2.99 safe, 1.81–2.99 grey, below 1.81 "
+                "distress. Calibrated on manufacturers — treat banks, "
+                "insurers and REITs as out of scope."
+            )
 
 
 # ==========================================================================
@@ -1833,6 +2204,7 @@ def _safe(func, *args, default: Any = None, **kwargs) -> Any:
 ROUTES = {
     "home": page_home,
     "equity": page_equity,
+    "supply_chain": page_supply_chain,
     "maritime": page_maritime,
     "aviation": page_aviation,
     "macro": page_macro,
