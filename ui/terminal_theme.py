@@ -57,9 +57,22 @@ html, body, [class*="css"], .stApp {{
 
 /* Hide Streamlit chrome - this is a terminal, not a web app. */
 #MainMenu, footer, header {{ visibility: hidden; }}
-.stDeployButton {{ display: none; }}
-[data-testid="stToolbar"] {{ display: none; }}
+.stDeployButton, [data-testid="stAppDeployButton"] {{ display: none; }}
+[data-testid="stToolbarActions"], [data-testid="stMainMenu"] {{ display: none; }}
 [data-testid="stDecoration"] {{ display: none; }}
+
+/* One thing in that header has to survive: the chevron that reopens a
+   collapsed sidebar. Streamlit renders it inside the toolbar, so the old
+   `[data-testid="stToolbar"] {{ display: none }}` removed the only way back
+   in - and the collapsed flag is persisted in localStorage, so the sidebar
+   stayed gone across reloads. The header itself remains visibility:hidden,
+   which keeps it click-through; only this subtree is painted back. */
+[data-testid="stExpandSidebarButton"],
+[data-testid="stExpandSidebarButton"] * {{ visibility: visible !important; }}
+[data-testid="stExpandSidebarButton"] button {{
+    color: var(--ot-amber) !important;
+    border-radius: 0 !important;
+}}
 
 /* ---------- Typography ----------------------------------------------- */
 h1, h2, h3, h4, h5, h6 {{
@@ -76,6 +89,20 @@ h2 {{ font-size: 1.05rem !important; }}
 h3 {{ font-size: 0.92rem !important; color: var(--ot-cyan) !important; }}
 
 p, span, div, label, li {{ font-family: {THEME.font_mono} !important; }}
+
+/* Icons are the exception. Streamlit draws Material Symbols as ligatures in a
+   <span>, so the blanket mono override above printed the literal ligature name
+   ("keyboard_arrow_right") instead of a chevron - expander arrows and the
+   sidebar collapse control both render through this. */
+[data-testid="stIconMaterial"],
+.material-icons, .material-symbols-rounded,
+span[class*="material-symbols"], span[class*="material-icons"] {{
+    font-family: "Material Symbols Rounded", "Material Icons" !important;
+    font-weight: 400 !important;
+    letter-spacing: normal !important;
+    text-transform: none !important;
+}}
+
 a {{ color: var(--ot-cyan) !important; text-decoration: none; }}
 a:hover {{ color: var(--ot-amber) !important; text-decoration: underline; }}
 code {{ background: var(--ot-raised) !important; color: var(--ot-green) !important;
@@ -85,10 +112,102 @@ code {{ background: var(--ot-raised) !important; color: var(--ot-green) !importa
 [data-testid="stSidebar"] {{
     background-color: var(--ot-panel) !important;
     border-right: 1px solid var(--ot-border);
+    width: 300px !important;
 }}
-[data-testid="stSidebar"] * {{ color: var(--ot-cyan); }}
+[data-testid="stSidebar"] > div {{ background-color: var(--ot-panel) !important; }}
+
+/* Text colour, but only on the elements that carry text. The old blanket
+   `[data-testid="stSidebar"] *` rule repainted every child - captions,
+   icons, dataframe cells - a flat cyan. */
+[data-testid="stSidebar"] p,
+[data-testid="stSidebar"] li,
+[data-testid="stSidebar"] label,
+[data-testid="stSidebar"] .stMarkdown {{ color: var(--ot-cyan); }}
 [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2,
 [data-testid="stSidebar"] h3 {{ color: var(--ot-amber) !important; }}
+[data-testid="stSidebar"] h3 {{
+    font-size: 0.78rem !important;
+    margin: 0.5rem 0 0.25rem !important;
+    border-bottom: 1px solid var(--ot-grid);
+    padding-bottom: 3px;
+}}
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"],
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {{
+    color: var(--ot-muted) !important;
+    font-size: 10px !important;
+    line-height: 1.45;
+}}
+
+/* Reclaim the empty 48px band Streamlit reserves above the sidebar body,
+   without clipping the collapse chevron that lives in it. */
+[data-testid="stSidebarHeader"] {{
+    padding: 0 !important;
+    height: 1.6rem !important;
+    min-height: 1.6rem !important;
+}}
+[data-testid="stSidebarUserContent"] {{ padding: 0 0 1.5rem !important; }}
+[data-testid="stSidebarContent"] {{ padding-left: 12px; padding-right: 12px; }}
+[data-testid="stSidebarCollapseButton"] button {{
+    color: var(--ot-muted) !important;
+    border-radius: 0 !important;
+}}
+[data-testid="stSidebarCollapseButton"] button:hover {{
+    color: var(--ot-amber) !important;
+    background: var(--ot-raised) !important;
+}}
+
+/* Long unbroken strings (API-key URLs, cache namespaces) were forcing the
+   sidebar wider than its own column and adding a horizontal scrollbar. */
+[data-testid="stSidebar"] p,
+[data-testid="stSidebar"] li,
+[data-testid="stSidebar"] .stMarkdown {{
+    overflow-wrap: anywhere;
+    word-break: break-word;
+}}
+[data-testid="stSidebar"] ul {{ padding-left: 1.1rem !important; margin-bottom: 0.4rem; }}
+[data-testid="stSidebar"] li {{ font-size: 11px; margin-bottom: 2px; }}
+
+/* Sidebar buttons: full width, wrapping labels. Recent-command buttons carry
+   arbitrary text ("AAPL EQUITY") and were overflowing their box. */
+[data-testid="stSidebar"] .stButton > button {{
+    width: 100%;
+    min-height: 26px;
+    padding: 3px 6px !important;
+    font-size: 10px !important;
+    letter-spacing: 0.06em;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    line-height: 1.25;
+}}
+[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] {{ gap: 6px; }}
+
+/* Expanders sat on the same colour as the sidebar itself, so they read as
+   loose text rather than a control. Lift them onto the raised tone. */
+[data-testid="stSidebar"] [data-testid="stExpander"] {{
+    background-color: var(--ot-raised) !important;
+}}
+[data-testid="stSidebar"] [data-testid="stExpander"] summary {{
+    background-color: var(--ot-raised) !important;
+    padding: 4px 8px !important;
+    font-size: 10px !important;
+}}
+[data-testid="stSidebar"] [data-testid="stExpander"] summary:hover {{
+    background-color: var(--ot-border) !important;
+}}
+
+/* Code samples inherited a blue-grey default that clashed with the palette. */
+[data-testid="stSidebar"] pre, [data-testid="stSidebar"] [data-testid="stCode"] {{
+    background: #000 !important;
+    border: 1px solid var(--ot-border);
+    border-radius: 0 !important;
+}}
+[data-testid="stSidebar"] pre code {{
+    background: transparent !important;
+    border: none !important;
+    font-size: 10px !important;
+    color: var(--ot-green) !important;
+}}
+[data-testid="stSidebar"] hr {{ margin: 0.5rem 0 !important; }}
 
 /* ---------- Inputs ---------------------------------------------------- */
 .stTextInput input, .stNumberInput input, .stTextArea textarea {{
