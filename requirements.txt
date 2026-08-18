@@ -2,6 +2,7 @@
 # OPEN-TERMINAL :: Free Bloomberg Terminal Alternative
 # All dependencies are free / open-source. No paid data subscriptions.
 # Install:  pip install -r requirements.txt
+#           python -m nltk.downloader -d .venv/share/nltk_data vader_lexicon
 #           playwright install chromium      (one-time browser download)
 # ============================================================================
 
@@ -23,7 +24,8 @@ ccxt>=4.4.0                 # Unified exchange API (public endpoints only)
 
 # --- OSINT: news -----------------------------------------------------------
 feedparser>=6.0.11          # RSS/Atom parsing
-nltk>=3.9                   # VADER sentiment (lexicon downloaded at runtime)
+nltk>=3.9                   # VADER sentiment. The lexicon is data, not code -
+                            # install it explicitly; see README, Headline sentiment.
 beautifulsoup4>=4.12.0
 lxml>=5.3.0
 

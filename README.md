@@ -8,8 +8,13 @@ No paid subscriptions. No API keys required to start.
 
 ```bash
 pip install -r requirements.txt
+python -m nltk.downloader -d .venv/share/nltk_data vader_lexicon
 streamlit run app.py
 ```
+
+The second line installs the sentiment lexicon. Skip it and everything still
+runs — headlines just score `+0.00` across the board. See
+[Headline sentiment](#headline-sentiment).
 
 ---
 
@@ -213,6 +218,42 @@ playwright install chromium              # only if enabling scrapers
 pip install transformers torch           # FinBERT instead of VADER (~3GB)
 pip install openbb                       # auto-detected if present (~1GB)
 ```
+
+## Headline sentiment
+
+The NEWS module scores headlines with VADER, whose lexicon ships as data
+rather than code. NLTK will fetch it on first use into `~/nltk_data`, so on
+most machines nothing is needed. Two things make that worth pinning down:
+
+**The failure is silent.** A missing lexicon does not raise — every headline
+scores a flat `+0.00`, which looks like a market with no opinion rather than a
+broken install. If the whole tape reads neutral, this is why.
+
+**NLTK 3.10 validates data paths.** It ships a `pathsec` layer that refuses
+any data file resolving outside an allowed root. Where the OS redirects the
+home directory — sandboxed, containerised or packaged-app environments — the
+lexicon lands in `~/nltk_data` but *resolves* somewhere else, and NLTK raises
+`PermissionError`. The app catches it and reports the misleading "resource not
+found, try re-downloading it" message; re-downloading writes to the same
+redirected path and fails again.
+
+Installing into a directory already on `nltk.data.path` sidesteps both:
+
+```bash
+python -m nltk.downloader -d .venv/share/nltk_data vader_lexicon
+```
+
+It lives inside the virtualenv, so a rebuilt venv needs it again. Verify with:
+
+```bash
+python -c "from nltk.sentiment.vader import SentimentIntensityAnalyzer as S; print(len(S().lexicon), 'entries')"
+```
+
+7502 entries means it loaded. A traceback means it did not.
+
+Swapping VADER for FinBERT (see [Optional extras](#optional-extras)) removes
+the dependency entirely — the model ships through `transformers`, not as
+downloaded corpus data.
 
 ## Environment flags
 
