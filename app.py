@@ -40,7 +40,7 @@ st.set_page_config(
 )
 
 from data_fetchers import aviation, equities, macro, maritime, news  # noqa: E402
-from data_fetchers import company_intel, supply_chain  # noqa: E402
+from data_fetchers import company_intel, portfolio, supply_chain  # noqa: E402
 from ui import components as ui  # noqa: E402
 from ui import maps  # noqa: E402
 from ui.terminal_theme import THEME, apply_theme  # noqa: E402
@@ -205,6 +205,12 @@ def execute_command(raw: str) -> None:
     elif module == "aviation":
         if subject in config.AVIATION_REGIONS:
             st.session_state["aviation_region"] = subject
+    elif module == "portfolio":
+        # "NVDA WATCH" adds a symbol without a trip to the editor. The add is
+        # idempotent and the row is deletable, so a typo costs one click.
+        symbol = equities.normalize_ticker(subject)
+        if portfolio.add_to_watchlist(symbol):
+            st.session_state["portfolio_toast"] = f"{symbol} added to watchlist."
     elif module == "macro":
         upper = subject.upper()
         if any(token in upper for token in ("CPI", "INFLATION", "PCE")):
@@ -273,7 +279,7 @@ def render_command_bar() -> None:
     shortcuts = [
         ("HOME", "home"), ("EQUITY", "equity"), ("SPLC", "supply_chain"),
         ("SHIP", "maritime"), ("FLY", "aviation"), ("MACRO", "macro"),
-        ("NEWS", "news"), ("HELP", "help"),
+        ("NEWS", "news"), ("PF", "portfolio"), ("HELP", "help"),
     ]
     cols = st.columns(len(shortcuts))
     for col, (label, module) in zip(cols, shortcuts):
@@ -2212,6 +2218,259 @@ def _safe(func, *args, default: Any = None, **kwargs) -> Any:
 # ==========================================================================
 # MAIN
 # ==========================================================================
+# ==========================================================================
+# PAGE: PORTFOLIO  (PF / WATCH / BRIEF)
+# ==========================================================================
+def _editor(frame: pd.DataFrame, columns: List[str], key: str,
+            config_map: Dict[str, Any]) -> pd.DataFrame:
+    """Editable grid seeded with the stored rows and one blank row to type in."""
+    seed = frame.copy()
+    if seed.empty:
+        seed = pd.DataFrame([{column: None for column in columns}])
+    return st.data_editor(
+        seed, key=key, num_rows="dynamic", use_container_width=True,
+        hide_index=True, column_config=config_map,
+    )
+
+
+def _brief_stamp(brief: Dict[str, Any]) -> str:
+    built = str(brief.get("built_at", ""))[:16].replace("T", " ")
+    return f"{brief.get('edition', '—')} · built {built} SGT" if built else str(
+        brief.get("edition", "—"))
+
+
+def page_portfolio() -> None:
+    ui.module_header(
+        "PORTFOLIO & WATCHLIST",
+        "HOLDINGS · MARK-TO-MARKET · 08:00 SGT BRIEF",
+    )
+
+    toast = st.session_state.pop("portfolio_toast", None)
+    if toast:
+        ui.alert(toast, "ok")
+
+    stored_holdings = portfolio.holdings()
+    stored_watchlist = portfolio.watchlist()
+
+    with st.spinner("Marking positions to market…"):
+        valued = portfolio.value_positions(stored_holdings)
+    summary = portfolio.portfolio_summary(valued)
+
+    now_sgt = portfolio.sgt_now()
+    edition = portfolio.edition_date(now_sgt)
+    next_build = portfolio.next_edition_at(now_sgt)
+
+    day_pnl = summary.get("day_pnl")
+    total_pnl = summary.get("pnl")
+
+    ui.metric_row([
+        ui.metric_tile("MARKET VALUE", summary.get("market_value"),
+                       value_format="${:,.0f}",
+                       subtitle=f"{summary.get('positions', 0)} positions"),
+        ui.metric_tile("DAY P&L", day_pnl, value_format="${:+,.0f}",
+                       subtitle="since previous close",
+                       accent=THEME.green if (day_pnl or 0) >= 0 else THEME.red),
+        ui.metric_tile("TOTAL P&L", total_pnl, value_format="${:+,.0f}",
+                       subtitle=(f"{summary['pnl_pct']:+,.1f}% on cost"
+                                 if summary.get("pnl_pct") is not None
+                                 else "no cost basis"),
+                       accent=THEME.green if (total_pnl or 0) >= 0 else THEME.red),
+        ui.metric_tile("WATCHLIST", len(stored_watchlist), value_format="{:,.0f}",
+                       subtitle="symbols tracked"),
+        ui.metric_tile("BRIEF EDITION", edition.strftime("%d %b"),
+                       subtitle=f"next {next_build:%d %b} 08:00 SGT"),
+        ui.metric_tile("SGT NOW", now_sgt.strftime("%H:%M"),
+                       subtitle=now_sgt.strftime("%a %d %b")),
+    ], columns=6)
+
+    tabs = st.tabs(["HOLDINGS", "WATCHLIST", "MORNING BRIEF"])
+
+    # ---- HOLDINGS --------------------------------------------------------
+    with tabs[0]:
+        st.caption(
+            "Edit any cell, use the blank row to add a position, select a row "
+            "and press delete to remove it. Nothing is written until you save. "
+            "Cost basis is optional — leave it empty and the position still "
+            "marks to market, it just cannot show a return."
+        )
+        edited = _editor(
+            stored_holdings, portfolio.HOLDING_COLUMNS, "pf_holdings_editor",
+            {
+                "ticker": st.column_config.TextColumn("TICKER", width="small"),
+                "quantity": st.column_config.NumberColumn("QTY", format="%.4f"),
+                "cost_basis": st.column_config.NumberColumn(
+                    "COST BASIS", format="%.4f", help="Average price paid"),
+                "note": st.column_config.TextColumn("NOTE"),
+            },
+        )
+
+        left, right = st.columns([1, 5])
+        with left:
+            if st.button("SAVE", key="pf_save_holdings",
+                         use_container_width=True):
+                portfolio.save(edited, stored_watchlist)
+                st.success("Holdings saved.")
+                st.rerun()
+        with right:
+            st.caption(f"Stored at `{config.PORTFOLIO_FILE}`")
+
+        if valued.empty:
+            ui.alert("No positions yet. Add a row above and save.", "warn")
+        else:
+            display = valued[[
+                "ticker", "quantity", "cost_basis", "price", "change_pct",
+                "day_pnl", "market_value", "cost", "pnl", "pnl_pct", "weight",
+            ]].rename(columns={
+                "ticker": "TICKER", "quantity": "QTY", "cost_basis": "BASIS",
+                "price": "LAST", "change_pct": "CHG %", "day_pnl": "DAY P&L",
+                "market_value": "MKT VALUE", "cost": "COST", "pnl": "P&L",
+                "pnl_pct": "P&L %", "weight": "WEIGHT %",
+            })
+            ui.styled_table(
+                display,
+                highlight_columns=["CHG %", "DAY P&L", "P&L", "P&L %"],
+            )
+
+            unpriced = int(valued["price"].isna().sum())
+            if unpriced:
+                ui.alert(
+                    f"{unpriced} position(s) returned no quote — check the "
+                    "symbol is the one Yahoo lists.", "warn")
+
+            weights = valued.dropna(subset=["weight"])
+            if len(weights) > 1:
+                ui.render_chart(
+                    ui.exposure_bars(weights, "ticker", "weight",
+                                     title="POSITION WEIGHT", height=280,
+                                     color=THEME.cyan),
+                    key="pf_weights")
+
+    # ---- WATCHLIST -------------------------------------------------------
+    with tabs[1]:
+        st.caption(
+            "Symbols you are following but do not hold. `NVDA WATCH` from the "
+            "command bar adds one without coming here."
+        )
+        edited_watch = _editor(
+            stored_watchlist, portfolio.WATCHLIST_COLUMNS, "pf_watch_editor",
+            {
+                "ticker": st.column_config.TextColumn("TICKER", width="small"),
+                "note": st.column_config.TextColumn("NOTE"),
+            },
+        )
+        if st.button("SAVE", key="pf_save_watch"):
+            portfolio.save(stored_holdings, edited_watch)
+            st.success("Watchlist saved.")
+            st.rerun()
+
+        quotes = portfolio.watchlist_quotes(stored_watchlist)
+        if quotes.empty:
+            ui.alert("Watchlist is empty.", "warn")
+        else:
+            ui.styled_table(
+                quotes.rename(columns={
+                    "ticker": "TICKER", "price": "LAST", "change": "CHG",
+                    "change_pct": "CHG %", "volume": "VOLUME", "note": "NOTE",
+                }),
+                highlight_columns=["CHG", "CHG %"],
+            )
+
+    # ---- MORNING BRIEF ---------------------------------------------------
+    with tabs[2]:
+        if stored_holdings.empty:
+            ui.alert(
+                "The brief is built from your holdings — add positions first.",
+                "warn")
+            return
+
+        archive = portfolio.stored_editions()
+        controls = st.columns([2, 1, 3])
+        with controls[0]:
+            options = [edition] + [d for d in archive if d != edition]
+            chosen = st.selectbox(
+                "EDITION", options, index=0,
+                format_func=lambda d: (f"{d:%a %d %b %Y}"
+                                       + (" · today" if d == edition else "")),
+            )
+        with controls[1]:
+            st.write("")
+            rebuild = st.button("REBUILD", key="pf_brief_rebuild",
+                                use_container_width=True)
+
+        if chosen == edition:
+            with st.spinner("Reading the tape for your positions…"):
+                brief = portfolio.get_brief(force=rebuild)
+        else:
+            brief = portfolio.load_edition(chosen) or {}
+
+        if not brief or brief.get("empty"):
+            ui.alert("Nothing recorded for this edition.", "warn")
+            return
+
+        summary_block = brief.get("summary", {})
+        net = summary_block.get("net_sentiment")
+        mood = ("RISK-ON" if (net or 0) > 0.15 else
+                "RISK-OFF" if (net or 0) < -0.15 else "MIXED")
+
+        st.markdown(
+            f'<div style="border-left:3px solid {THEME.amber};padding:6px 10px;'
+            f'background:{THEME.bg_panel};font-size:11px;color:{THEME.muted};'
+            f'margin-bottom:8px;">'
+            f'EDITION {_brief_stamp(brief)} — {summary_block.get("stories", 0)} '
+            f'stories across {summary_block.get("symbols", 0)} positions. '
+            f'Stories are ranked by sentiment strength weighted by position '
+            f'size, so a soft story about a large holding outranks a loud one '
+            f'about a small holding.</div>',
+            unsafe_allow_html=True,
+        )
+
+        movers = summary_block.get("movers") or []
+        ui.metric_row([
+            ui.metric_tile("PORTFOLIO MOOD", mood,
+                           subtitle=(f"net {net:+.2f}" if net is not None
+                                     else "no scored stories"),
+                           accent=THEME.green if mood == "RISK-ON"
+                           else THEME.red if mood == "RISK-OFF" else THEME.amber),
+            ui.metric_tile("STORIES", summary_block.get("stories"),
+                           value_format="{:,.0f}", subtitle="in this edition"),
+        ] + [
+            ui.metric_tile(f"MOVER · {m['ticker']}", m["change_pct"],
+                           value_format="{:+,.2f}%", subtitle="last session",
+                           accent=THEME.green if m["change_pct"] >= 0
+                           else THEME.red)
+            for m in movers
+        ], columns=2 + len(movers))
+
+        st.markdown("###### TOP STORIES FOR THIS BOOK")
+        top = pd.DataFrame(brief.get("top_stories", []))
+        if top.empty:
+            ui.alert(
+                "No scored stories this edition — headlines were retrieved but "
+                "all scored neutral.", "warn")
+        else:
+            top["published"] = pd.to_datetime(top["published"], errors="coerce",
+                                              utc=True)
+            top["source"] = top["ticker"] + " · " + top["source"]
+            ui.news_feed(top, max_rows=12)
+
+        st.markdown("###### BY POSITION")
+        for position in brief.get("positions", []):
+            weight = position.get("weight")
+            heading = (f"{position['ticker']}  ·  "
+                       f"{weight:,.1f}% of book" if weight is not None
+                       else position["ticker"])
+            counts = (f"{position['bullish']}▲ / {position['bearish']}▼ / "
+                      f"{position['neutral']}■")
+            with st.expander(f"{heading}   —   {counts}"):
+                stories = pd.DataFrame(position.get("stories", []))
+                if stories.empty:
+                    st.caption("No headlines retrieved for this symbol.")
+                    continue
+                stories["published"] = pd.to_datetime(
+                    stories["published"], errors="coerce", utc=True)
+                ui.news_feed(stories, max_rows=8)
+
+
 ROUTES = {
     "home": page_home,
     "equity": page_equity,
@@ -2220,6 +2479,7 @@ ROUTES = {
     "aviation": page_aviation,
     "macro": page_macro,
     "news": page_news,
+    "portfolio": page_portfolio,
     "help": page_help,
 }
 

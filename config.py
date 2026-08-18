@@ -44,6 +44,11 @@ DATA_DIR.mkdir(exist_ok=True)
 CACHE_DB = DATA_DIR / "cache.sqlite"
 HTTP_CACHE_DB = DATA_DIR / "http_cache"  # requests-cache appends .sqlite
 
+# User-authored state. Deliberately outside the cache: PURGE empties the
+# cache, and a button that also deleted your positions would be a trap.
+PORTFOLIO_FILE = DATA_DIR / "portfolio.json"
+BRIEF_DIR = DATA_DIR / "briefs"
+
 
 # ==========================================================================
 # CREDENTIALS
@@ -92,6 +97,16 @@ class CacheTTL:
 
 
 TTL = CacheTTL()
+
+
+# ==========================================================================
+# MORNING BRIEF
+# ==========================================================================
+# The edition cutover. Singapore is UTC+8 with no daylight saving, so this is
+# a wall-clock hour that never shifts.
+BRIEF_HOUR: int = 8
+BRIEF_MAX_SYMBOLS: int = 25       # positions to research per edition
+BRIEF_STORIES_PER_POSITION: int = 4
 
 
 # ==========================================================================
@@ -485,6 +500,12 @@ COMMAND_FUNCTIONS: Dict[str, str] = {
     "MACRO": "macro", "ECO": "macro", "YCRV": "macro", "CURVE": "macro",
     # News
     "NEWS": "news", "N": "news", "TOP": "news", "OSINT": "news",
+    # Portfolio. Bloomberg's mnemonic for this is PORT, but PORT is already
+    # bound to the maritime module here and rebinding it would break muscle
+    # memory that already exists.
+    "PF": "portfolio", "PORTFOLIO": "portfolio", "HOLD": "portfolio",
+    "HOLDINGS": "portfolio", "WATCH": "portfolio", "WL": "portfolio",
+    "BRIEF": "portfolio", "AM": "portfolio",
     # Home
     "HOME": "home", "MENU": "home", "DASH": "home",
 }
@@ -505,6 +526,9 @@ COMMAND SYNTAX:  <SUBJECT> <FUNCTION>
   CPI ECO          Macro series browser, jumps to inflation
   NEWS             OSINT news terminal with sentiment scoring
   ENERGY TOP       News filtered to the energy/commodity desk
+  PF               Portfolio: holdings, watchlist, 08:00 SGT holdings brief
+  BRIEF            Same page, opens on the morning brief
+  NVDA WATCH       Add a symbol to the watchlist without opening the editor
   HOME             Return to the overview dashboard
   HELP             This screen
 """.strip()

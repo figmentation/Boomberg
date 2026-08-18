@@ -1050,13 +1050,22 @@ def supply_chain_graph(network: Dict[str, Any], height: int = 640) -> go.Figure:
 
 def exposure_bars(df: pd.DataFrame, label_col: str, value_col: str,
                   title: str = "", height: int = 300,
-                  suffix: str = "%") -> go.Figure:
-    """Horizontal bars for revenue-by-region / commodity-correlation panels."""
+                  suffix: str = "%", color: Optional[str] = None) -> go.Figure:
+    """
+    Horizontal bars for revenue-by-region / commodity-correlation panels.
+
+    Args:
+        color: One colour for every bar. Pass this for magnitudes that are
+               always positive - portfolio weights, for instance - where the
+               default red/green would paint the whole chart green and imply
+               a gain that isn't being measured.
+    """
     if df.empty:
         return style_figure(go.Figure(), height=height, title=title)
 
     frame = df.sort_values(value_col)
-    colors = [THEME.green if v >= 0 else THEME.red for v in frame[value_col]]
+    colors = ([color] * len(frame) if color
+              else [THEME.green if v >= 0 else THEME.red for v in frame[value_col]])
 
     fig = go.Figure(go.Bar(
         x=frame[value_col], y=frame[label_col], orientation="h",
