@@ -476,6 +476,9 @@ def get_company_info(ticker: str) -> Dict[str, Any]:
 
     keys = [
         "shortName", "longName", "sector", "industry", "country", "website",
+        # Classification keys: the machine-readable form of sector/industry,
+        # used to look up the issuer's own peer group.
+        "sectorKey", "industryKey",
         "longBusinessSummary", "fullTimeEmployees", "currency", "exchange",
         "marketCap", "enterpriseValue", "trailingPE", "forwardPE",
         "priceToBook", "priceToSalesTrailing12Months", "enterpriseToEbitda",

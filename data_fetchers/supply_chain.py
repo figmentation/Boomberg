@@ -21,7 +21,6 @@ primary source, and the gaps are shown as gaps:
   * Suppliers are disclosed far more rarely than customers - there is no
     reporting requirement at all. Expect thin upstream coverage. That is a
     property of US disclosure law, not a bug here.
-  * Competitors come from sector/industry peers, not from a curated map.
   * Geographic exposure is real reported revenue by region, parsed out of the
     XBRL-derived tables SEC generates for each filing.
   * Commodity dependency is a *derived statistic* - the correlation of the
@@ -858,10 +857,66 @@ def get_credit_risk(ticker: str) -> Dict[str, Any]:
 
 
 # ==========================================================================
-# 5. NETWORK ASSEMBLY
+# 5. INDUSTRY COMPARABLES
+# ==========================================================================
+@cached(ttl=config.TTL.fundamentals, namespace="splc_industry_peers")
+def get_industry_peers(ticker: str, limit: int = 6) -> List[Dict[str, Any]]:
+    """
+    Comparable companies, taken from the issuer's own industry classification.
+
+    Yahoo assigns every listed company an industry key and publishes the
+    constituents of each industry ranked by market weight. That is a real
+    classification of this specific company, not a hand-written sector list -
+    the terminal never asserts a peer it did not derive.
+
+    Returns:
+        [{ticker, name, weight}] ordered by market weight, focal name removed.
+        Empty when the classification or its constituent list is unavailable;
+        the caller draws no comparables rather than inventing them.
+    """
+    if not equities.YFINANCE_AVAILABLE:
+        return []
+
+    ticker = ticker.upper()
+    industry_key = (equities.get_company_info(ticker) or {}).get("industryKey")
+    if not industry_key:
+        return []
+
+    try:
+        table = equities.yf.Industry(industry_key).top_companies
+    except Exception as exc:
+        log.warning("industry peers unavailable for %s: %s", ticker, exc)
+        return []
+
+    if table is None or table.empty:
+        return []
+
+    peers: List[Dict[str, Any]] = []
+    for symbol, row in table.iterrows():
+        symbol = str(symbol).upper()
+        if symbol == ticker:
+            continue
+        peers.append({
+            "ticker": symbol,
+            "name": str(row.get("name") or symbol),
+            "weight": float(row.get("market weight") or 0.0),
+        })
+        if len(peers) >= limit:
+            break
+    return peers
+
+
+def industry_label(ticker: str) -> str:
+    """Human-readable industry name used to caption the comparables row."""
+    info = equities.get_company_info(ticker) or {}
+    return str(info.get("industry") or info.get("sector") or "").strip()
+
+
+# ==========================================================================
+# 6. NETWORK ASSEMBLY
 # ==========================================================================
 @cached(ttl=config.TTL.fundamentals, namespace="splc_network")
-def build_network(ticker: str, include_peers: bool = True) -> Dict[str, Any]:
+def build_network(ticker: str) -> Dict[str, Any]:
     """
     Assemble the graph the SPLC map draws.
 
@@ -869,6 +924,11 @@ def build_network(ticker: str, include_peers: bool = True) -> Dict[str, Any]:
         {nodes: [...], edges: [...], stats: {...}}
         Node: {id, label, tier, pct, named, sector, source_url}
               tier is "focal" | "upstream" | "downstream" | "peer".
+
+    Counterparties trace to a disclosure in the issuer's own filings.
+    Comparables are the issuer's own industry classification ranked by market
+    weight - derived per company, never a hand-written sector list. When the
+    classification is unavailable the row is simply absent.
     """
     info = equities.get_company_info(ticker)
     focal_name = info.get("longName") or info.get("shortName") or ticker
@@ -881,8 +941,12 @@ def build_network(ticker: str, include_peers: bool = True) -> Dict[str, Any]:
     edges: List[Dict[str, Any]] = []
 
     counterparties = get_counterparties(ticker)
-    for _, row in counterparties.iterrows():
-        node_id = row["counterparty_ticker"] or f"{row['counterparty']}"
+    for position, (_, row) in enumerate(counterparties.iterrows()):
+        # Undisclosed counterparties all share the label "Undisclosed
+        # customer", so the label alone collides every one of them onto a
+        # single node. Qualify unticketed rows by position to keep each
+        # disclosure its own node.
+        node_id = row["counterparty_ticker"] or f"{row['counterparty']}#{position}"
         tier = "upstream" if row["relationship"] == "supplier" else "downstream"
         nodes.append({
             "id": node_id, "label": row["counterparty"], "tier": tier,
@@ -897,20 +961,12 @@ def build_network(ticker: str, include_peers: bool = True) -> Dict[str, Any]:
             "named": bool(row["named"]), "quote": row["quote"],
         })
 
-    if include_peers:
-        for peer in equities.suggest_peers(ticker, 6):
-            if peer.upper() == ticker.upper():
-                continue
-            if any(n["id"] == peer.upper() for n in nodes):
-                continue
-            nodes.append({
-                "id": peer.upper(), "label": peer.upper(), "tier": "peer",
-                "pct": None, "named": True, "sector": info.get("sector"),
-                "source_url": None,
-            })
-            edges.append({"source": ticker.upper(), "target": peer.upper(),
-                          "weight": None, "kind": "competitor",
-                          "named": True, "quote": ""})
+    for peer in get_industry_peers(ticker, 6):
+        nodes.append({
+            "id": peer["ticker"], "label": peer["name"], "tier": "peer",
+            "pct": None, "named": True, "sector": info.get("sector"),
+            "weight": peer["weight"], "source_url": None,
+        })
 
     if counterparties.empty:
         named = downstream = single = aggregates = pd.DataFrame()
@@ -927,11 +983,12 @@ def build_network(ticker: str, include_peers: bool = True) -> Dict[str, Any]:
         "edges": edges,
         "stats": {
             "counterparties": len(counterparties),
+            "peers": sum(1 for n in nodes if n["tier"] == "peer"),
+            "industry": industry_label(ticker),
             "named": len(named),
             "customers": len(downstream),
             "suppliers": len(counterparties) - len(downstream)
             if not counterparties.empty else 0,
-            "peers": sum(1 for n in nodes if n["tier"] == "peer"),
             # Largest SINGLE customer. Deliberately excludes aggregates.
             "max_customer_pct": float(single["pct_of_revenue"].max())
             if not single.empty else None,
@@ -947,6 +1004,29 @@ def build_network(ticker: str, include_peers: bool = True) -> Dict[str, Any]:
             if not aggregates.empty else None,
         },
     }
+
+
+def refresh(ticker: str) -> None:
+    """
+    Drop this issuer's cached supply-chain data and refetch it.
+
+    Backs the SPLC page's REBUILD control. Every fetcher here memoises into
+    the project's SQLite cache, so `st.cache_data.clear()` does not touch
+    them - the `_refresh` kwarg the @cached wrapper exposes does.
+
+    Order matters: build_network reads get_counterparties and
+    get_industry_peers, so those are refreshed first. Refreshing the network
+    alone would reassemble it from exactly the same stale rows.
+    """
+    ticker = ticker.upper()
+    for fetcher in (get_counterparties, get_industry_peers,
+                    get_geographic_revenue, get_commodity_exposure,
+                    get_credit_risk, build_network):
+        try:
+            fetcher(ticker, _refresh=True)
+        except Exception as exc:               # one dead upstream must not
+            log.warning("refresh %s failed for %s: %s",                # strand
+                        getattr(fetcher, "__name__", fetcher), ticker, exc)
 
 
 def concentration_verdict(stats: Dict[str, Any]) -> Tuple[str, str]:
@@ -981,6 +1061,7 @@ def concentration_verdict(stats: Dict[str, Any]) -> Tuple[str, str]:
 
 __all__ = [
     "get_counterparties", "get_geographic_revenue", "get_commodity_exposure",
-    "get_credit_risk", "build_network", "concentration_verdict",
+    "get_credit_risk", "get_industry_peers", "build_network",
+    "refresh", "concentration_verdict",
     "COMMODITY_SYMBOLS", "REGION_COORDS",
 ]

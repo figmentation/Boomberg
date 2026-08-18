@@ -989,18 +989,20 @@ def page_supply_chain() -> None:
     ui.module_header("SUPPLY CHAIN ANALYSIS",
                      "COUNTERPARTY · GEOGRAPHIC · COMMODITY · CREDIT EXPOSURE")
 
-    controls = st.columns([2, 1, 1])
+    controls = st.columns([3, 1])
     with controls[0]:
         entered = st.text_input("TICKER", value=ticker, key="splc_ticker").upper()
         if entered and entered != ticker:
             st.session_state["ticker"] = equities.normalize_ticker(entered)
             st.rerun()
     with controls[1]:
-        show_peers = st.checkbox("SHOW COMPETITORS", value=True)
-    with controls[2]:
         st.write("")
         if st.button("REBUILD", use_container_width=True):
-            st.cache_data.clear()
+            # Every figure on this page is memoised in the project's SQLite
+            # cache, which st.cache_data.clear() does not reach - clearing it
+            # dropped the tape quotes and left the map untouched. Flag the
+            # rebuild and let the fetch below refetch this issuer.
+            st.session_state["splc_refresh"] = True
             st.rerun()
 
     st.markdown(
@@ -1015,8 +1017,14 @@ def page_supply_chain() -> None:
         unsafe_allow_html=True,
     )
 
-    with st.spinner("Mining filings and assembling the network…"):
-        network = _safe(supply_chain.build_network, ticker, show_peers, default={})
+    rebuilding = st.session_state.pop("splc_refresh", False)
+    spinner = ("Refetching filings and rebuilding the network…" if rebuilding
+               else "Mining filings and assembling the network…")
+
+    with st.spinner(spinner):
+        if rebuilding:
+            _safe(supply_chain.refresh, ticker)
+        network = _safe(supply_chain.build_network, ticker, default={})
         counterparties = _safe(supply_chain.get_counterparties, ticker,
                                default=pd.DataFrame())
 
@@ -1035,7 +1043,8 @@ def page_supply_chain() -> None:
                        accent=THEME.green if stats.get("named") else THEME.muted),
         ui.metric_tile("CUSTOMERS", stats.get("customers"), value_format="{:,.0f}"),
         ui.metric_tile("SUPPLIERS", stats.get("suppliers"), value_format="{:,.0f}"),
-        ui.metric_tile("COMPETITORS", stats.get("peers"), value_format="{:,.0f}"),
+        ui.metric_tile("COMPARABLES", stats.get("peers"), value_format="{:,.0f}",
+                       subtitle=stats.get("industry") or "industry peers"),
         ui.metric_tile("TOP EXPOSURE", stats.get("max_customer_pct"),
                        subtitle="% of revenue", value_format="{:,.0f}%",
                        accent=THEME.red if top >= 25 else THEME.amber),
@@ -1052,10 +1061,12 @@ def page_supply_chain() -> None:
             ui.render_chart(ui.supply_chain_graph(network),
                             key=f"splc_net_{ticker}")
             st.caption(
-                "Node size scales with disclosed revenue share. A thick solid "
-                "edge is a named counterparty; a dotted edge is a disclosure "
-                "where the issuer withheld the name. Competitors are sector "
-                "peers, not a filed relationship."
+                "Suppliers left, customers right, each hub carrying the total "
+                "count for that side. A thick solid edge is a named "
+                "counterparty; a dotted edge is a disclosure where the issuer "
+                "withheld the name. Comparables below are the issuer's own "
+                "industry classification ranked by market weight — a peer "
+                "group derived per company, not a fixed list."
             )
 
     # ---- COUNTERPARTIES --------------------------------------------------

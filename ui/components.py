@@ -845,110 +845,208 @@ def executive_card(row: pd.Series, currency: str = "$") -> str:
 # ==========================================================================
 # SUPPLY CHAIN NETWORK
 # ==========================================================================
-_TIER_STYLE: Dict[str, Tuple[float, str, str]] = {
-    # tier: (x position, colour, label)
-    "upstream": (-1.0, THEME.cyan, "SUPPLIER"),
-    "focal": (0.0, THEME.amber, "FOCAL"),
-    "downstream": (1.0, THEME.green, "CUSTOMER"),
-    "peer": (0.0, THEME.magenta, "COMPETITOR"),
-}
+# Geometry in data units. The layout is fixed rather than force-directed: a
+# supply chain has an inherent direction, and a spring layout hides it.
+# Suppliers feed the focal company from the left, customers draw from it on
+# the right, and industry comparables hang below - the shape a terminal user
+# reads without needing a legend.
+# Cards are sized generously against the axis range: the boxes scale with the
+# container but the type does not, so a tight box overflows on narrow screens.
+_CARD_W, _CARD_H, _CARD_GAP = 2.62, 0.62, 0.24
+_COL_X, _HUB_X = 3.38, 1.30
+_FOCAL_W, _FOCAL_H = 3.05, 1.50
+_COMP_W, _COMP_H = 1.52, 0.54
+_MAX_CARDS = 6          # per column; the remainder is reported in the hub
 
 
-def supply_chain_graph(network: Dict[str, Any], height: int = 560) -> go.Figure:
+def _rect(fig, x, y, w, h, border, fill, width=1):
+    """Card outline centred on (x, y)."""
+    fig.add_shape(type="rect", x0=x - w / 2, x1=x + w / 2,
+                  y0=y - h / 2, y1=y + h / 2, layer="below",
+                  line=dict(color=border, width=width), fillcolor=fill)
+
+
+def _text(fig, x, y, text, color, size=9, anchor="center"):
+    fig.add_annotation(x=x, y=y, text=text, showarrow=False, align="left",
+                       xanchor=anchor, yanchor="middle",
+                       font=dict(size=size, color=color, family=THEME.font_mono))
+
+
+def _wire(fig, start, end, color, width=1.0, dash="solid"):
+    fig.add_shape(type="line", x0=start[0], y0=start[1], x1=end[0], y1=end[1],
+                  layer="below", line=dict(color=color, width=width, dash=dash))
+
+
+def _stack(count, size, gap):
+    """Centres for `count` cards laid out symmetrically about zero."""
+    pitch = size + gap
+    return [(index - (count - 1) / 2) * pitch for index in range(count)]
+
+
+def _card_lines(node, quantified):
+    """Title and metric line for one counterparty card."""
+    label = str(node.get("label") or node["id"])
+    if len(label) > 20:
+        label = label[:19] + "…"
+
+    pct = node.get("pct")
+    if pct:
+        metric = f"REV {pct:,.1f}%"
+    elif quantified:
+        metric = "SHARE NOT QUANTIFIED"
+    else:
+        metric = "DISCLOSED"
+
+    if not node.get("named", True):
+        metric += " · WITHHELD"
+    return label, metric
+
+
+def supply_chain_graph(network: Dict[str, Any], height: int = 640) -> go.Figure:
     """
-    Three-column flow diagram: suppliers -> company -> customers, with
-    competitors ranged below the focal node.
+    Counterparty map in the shape a supply-chain terminal draws it.
 
-    A deliberate layout choice over a force-directed graph: supply chains have
-    an inherent direction, and a spring layout hides it. Node size encodes the
-    disclosed percentage; a dashed outline marks a counterparty the issuer
-    declined to name.
+    Suppliers column -> aggregation hub -> focal company -> aggregation hub ->
+    customers column, with industry comparables on a spur below. Card size is
+    constant and the exposure rides in the metric line, which reads more
+    precisely than node area for the handful of relationships a 10-K names.
+
+    Each hub reports the *total* count on that side; the column shows the
+    largest few. A dotted edge is a disclosure where the issuer withheld the
+    counterparty's name.
     """
     nodes = network.get("nodes", [])
-    edges = network.get("edges", [])
+    stats = network.get("stats", {}) or {}
 
     if not nodes:
-        fig = go.Figure()
-        return style_figure(fig, height=height, title="NO NETWORK DATA")
+        return style_figure(go.Figure(), height=height, title="NO NETWORK DATA")
 
-    # ---- position every node ---------------------------------------------
-    by_tier: Dict[str, List[Dict[str, Any]]] = {}
-    for node in nodes:
-        by_tier.setdefault(node.get("tier", "peer"), []).append(node)
+    focal = next((n for n in nodes if n.get("tier") == "focal"), None)
+    suppliers = [n for n in nodes if n.get("tier") == "upstream"]
+    customers = [n for n in nodes if n.get("tier") == "downstream"]
+    comps = [n for n in nodes if n.get("tier") == "peer"]
 
-    positions: Dict[str, Tuple[float, float]] = {}
-    for tier, members in by_tier.items():
-        x_base = _TIER_STYLE.get(tier, _TIER_STYLE["peer"])[0]
-        count = len(members)
-        for index, node in enumerate(members):
-            if tier == "focal":
-                y = 0.0
-            elif tier == "peer":
-                # Competitors fan out below the focal company.
-                y = -1.6 - index * 0.42
-                x_base = 0.0
-            else:
-                y = (index - (count - 1) / 2) * 0.75
-            positions[node["id"]] = (x_base, y)
+    def by_share(group):
+        return sorted(group,
+                      key=lambda n: (n.get("pct") is None, -(n.get("pct") or 0)))
 
-    # ---- edges ------------------------------------------------------------
-    traces: List[go.Scatter] = []
-    for edge in edges:
-        start = positions.get(edge["source"])
-        end = positions.get(edge["target"])
-        if not start or not end:
-            continue
-        competitor = edge.get("kind") == "competitor"
-        weight = edge.get("weight") or 0
-        traces.append(go.Scatter(
-            x=[start[0], end[0]], y=[start[1], end[1]],
-            mode="lines",
-            line=dict(
-                color=THEME.magenta if competitor else (
-                    THEME.grid if not edge.get("named") else THEME.amber),
-                width=1.0 if competitor else max(1.0, min(6.0, weight / 12 + 1)),
-                dash="dot" if competitor or not edge.get("named") else "solid",
-            ),
-            hoverinfo="skip", showlegend=False,
-        ))
+    shown_suppliers = by_share(suppliers)[:_MAX_CARDS]
+    shown_customers = by_share(customers)[:_MAX_CARDS]
 
-    # ---- nodes, one trace per tier so the legend is meaningful ------------
-    for tier, members in by_tier.items():
-        x_values, y_values, sizes, texts, hovers, lines = [], [], [], [], [], []
-        for node in members:
-            x, y = positions[node["id"]]
-            x_values.append(x)
-            y_values.append(y)
-            pct = node.get("pct")
-            sizes.append(20 if tier == "focal" else
-                         (14 + min(30, (pct or 0) * 0.45)))
-            label = node.get("label") or node["id"]
-            texts.append(str(label)[:22])
-            hover = f"<b>{label}</b><br>{_TIER_STYLE.get(tier, ('', '', tier))[2]}"
-            if pct:
-                hover += f"<br>{pct:.0f}% of revenue"
-            if not node.get("named", True):
-                hover += "<br><i>name withheld in filing</i>"
-            hovers.append(hover)
-            lines.append(1 if node.get("named", True) else 3)
+    fig = go.Figure()
+    hover_x, hover_y, hover_text = [], [], []
+    top = stats.get("max_customer_pct")
 
-        color = _TIER_STYLE.get(tier, _TIER_STYLE["peer"])[1]
-        traces.append(go.Scatter(
-            x=x_values, y=y_values, mode="markers+text",
-            marker=dict(size=sizes, color=color, symbol="square",
-                        line=dict(color=THEME.bg, width=lines)),
-            text=texts,
-            textposition="middle right" if tier != "focal" else "top center",
-            textfont=dict(size=9, color=THEME.white),
-            hovertext=hovers, hoverinfo="text",
-            name=_TIER_STYLE.get(tier, ("", "", tier))[2],
-        ))
+    # ---- focal company ---------------------------------------------------
+    _rect(fig, 0, 0, _FOCAL_W, _FOCAL_H, THEME.amber, THEME.bg_raised, width=2)
+    focal_label = str((focal or {}).get("label") or "—")
+    if len(focal_label) > 24:
+        focal_label = focal_label[:23] + "…"
+    _text(fig, 0, 0, "<br>".join([
+        f"<b>{focal_label}</b>",
+        f"<span style='color:{THEME.muted}'>{(focal or {}).get('id', '')}</span>",
+        f"DISCLOSED {stats.get('counterparties', 0)}"
+        f"   NAMED {stats.get('named', 0)}",
+        f"TOP CUSTOMER {top:,.0f}%" if top else "TOP CUSTOMER —",
+    ]), THEME.white, size=10)
 
-    fig = go.Figure(traces)
-    fig.update_xaxes(visible=False, range=[-1.7, 2.0])
-    fig.update_yaxes(visible=False)
-    return style_figure(fig, height=height, title="", showlegend=True)
+    # ---- one side of the chain -------------------------------------------
+    def draw_side(group, total, sign, colour, heading):
+        hub = (sign * _HUB_X, 0.0)
+        if not group:
+            _text(fig, sign * _COL_X, 0.0, f"NO {heading} DISCLOSED",
+                  THEME.muted, size=9)
+            return
 
+        _rect(fig, hub[0], hub[1], 0.30, 0.30, colour, THEME.bg_panel)
+        _wire(fig, hub, (sign * _FOCAL_W / 2, 0), colour, 1.4)
+        _text(fig, hub[0], 0.44, f"<b>{total:,}</b> {heading}", colour, size=9)
+
+        for node, y in zip(group, _stack(len(group), _CARD_H, _CARD_GAP)):
+            x = sign * _COL_X
+            named = node.get("named", True)
+            edge_colour = colour if named else THEME.grid
+            _rect(fig, x, y, _CARD_W, _CARD_H, edge_colour, THEME.bg_panel)
+
+            title, metric = _card_lines(node, bool(top))
+            left = x - _CARD_W / 2 + 0.12
+            _text(fig, left, y + 0.11, f"<b>{title}</b>", THEME.white,
+                  size=9, anchor="left")
+            _text(fig, left, y - 0.13,
+                  f"<span style='color:{THEME.muted}'>{metric}</span>",
+                  THEME.muted, size=8, anchor="left")
+
+            _wire(fig, (x - sign * _CARD_W / 2, y), hub, edge_colour,
+                  width=max(1.0, min(5.0, (node.get("pct") or 0) / 12 + 1)),
+                  dash="solid" if named else "dot")
+
+            detail = f"<b>{node.get('label')}</b><br>{heading.title()[:-1]}"
+            if node.get("pct"):
+                detail += f"<br>{node['pct']:,.1f}% of revenue"
+            if not named:
+                detail += "<br><i>name withheld in filing</i>"
+            hover_x.append(x)
+            hover_y.append(y)
+            hover_text.append(detail)
+
+    draw_side(shown_suppliers, stats.get("suppliers", 0), -1,
+              THEME.cyan, "SUPPLIERS")
+    draw_side(shown_customers, stats.get("customers", 0), 1,
+              THEME.green, "CUSTOMERS")
+
+    # ---- industry comparables --------------------------------------------
+    rows = max(len(shown_suppliers), len(shown_customers), 1)
+    column_half = rows * (_CARD_H + _CARD_GAP) / 2
+    comp_y = -max(column_half, _FOCAL_H / 2) - 1.35
+
+    if comps:
+        hub = (0.0, comp_y + 0.62)
+        _rect(fig, hub[0], hub[1], 0.30, 0.30, THEME.muted, THEME.bg_panel)
+        _wire(fig, (0, -_FOCAL_H / 2), hub, THEME.muted, 1.2, dash="dot")
+        industry = str(stats.get("industry") or "industry").upper()
+        _text(fig, 0, hub[1] + 0.36,
+              f"<b>{len(comps)}</b> COMPARABLES · {industry}",
+              THEME.muted, size=9)
+
+        for node, x in zip(comps, _stack(len(comps), _COMP_W, 0.14)):
+            _rect(fig, x, comp_y, _COMP_W, _COMP_H, THEME.border,
+                  THEME.bg_panel)
+            _wire(fig, hub, (x, comp_y + _COMP_H / 2), THEME.border, 1.0,
+                  dash="dot")
+            weight = node.get("weight")
+            _text(fig, x, comp_y + 0.10, f"<b>{node['id']}</b>", THEME.white,
+                  size=9)
+            if weight:
+                _text(fig, x, comp_y - 0.12,
+                      f"<span style='color:{THEME.muted}'>"
+                      f"{weight * 100:,.1f}% WT</span>", THEME.muted, size=8)
+
+            hover_x.append(x)
+            hover_y.append(comp_y)
+            hover_text.append(
+                f"<b>{node.get('label')}</b><br>Industry comparable"
+                + (f"<br>{weight * 100:,.1f}% of industry market weight"
+                   if weight else ""))
+
+    # ---- hover layer -----------------------------------------------------
+    fig.add_trace(go.Scatter(
+        x=hover_x, y=hover_y, mode="markers",
+        marker=dict(size=1, color="rgba(0,0,0,0)"),
+        hovertext=hover_text, hoverinfo="text", showlegend=False,
+    ))
+
+    # ---- frame -----------------------------------------------------------
+    # Ranges are pinned so the map always opens whole. Shapes and annotations
+    # carry no autoscale extent, so without this the axes fit only the
+    # invisible hover layer and clip every card.
+    top_y = max(column_half + 0.85, _FOCAL_H / 2 + 0.85)
+    bottom_y = (comp_y - _COMP_H) if comps else -top_y
+    half_width = _COL_X + _CARD_W / 2 + 0.22
+
+    fig.update_xaxes(range=[-half_width, half_width], visible=False)
+    fig.update_yaxes(range=[bottom_y - 0.45, top_y], visible=False)
+
+    return style_figure(fig, height=height, title="", showlegend=False)
 
 def exposure_bars(df: pd.DataFrame, label_col: str, value_col: str,
                   title: str = "", height: int = 300,
