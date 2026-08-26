@@ -284,7 +284,9 @@ def chokepoint_overview_map(statuses: List[Dict[str, Any]]) -> Optional[Any]:
                 f'Vessels: {count}<br>'
                 f'Anchored: {status.get("anchored_count", "—")}<br>'
                 f'Under way: {status.get("underway_count", "—")}<br>'
-                f'Congestion: {status.get("congestion_ratio", "—")}x baseline<br>'
+                f'Congestion: {status.get("congestion_ratio") or "—"}x '
+                f'measured baseline '
+                f'({status.get("baseline_vessels") or "not yet measured"})<br>'
                 f'Status: <b style="color:{color};">{label}</b><br>'
                 f'<i>{status.get("description", "")}</i></div>',
                 max_width=300,

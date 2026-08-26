@@ -159,18 +159,6 @@ THEME = Theme()
 # ==========================================================================
 DEFAULT_TICKER = "AAPL"
 
-# Sector peer sets used by the comparables table when the user doesn't supply
-# their own list. Keep these short - each name costs one yfinance round trip.
-PEER_GROUPS: Dict[str, List[str]] = {
-    "megacap_tech": ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA"],
-    "semis": ["NVDA", "AMD", "INTC", "TSM", "AVGO", "MU"],
-    "banks": ["JPM", "BAC", "C", "WFC", "GS", "MS"],
-    "energy": ["XOM", "CVX", "COP", "SLB", "OXY", "PSX"],
-    "shipping": ["ZIM", "MATX", "GOGL", "SBLK", "FRO", "DHT"],
-    "airlines": ["DAL", "UAL", "AAL", "LUV", "ALK"],
-    "defense": ["LMT", "RTX", "NOC", "GD", "BA"],
-}
-
 # Ticker-tape instruments for the scrolling banner.
 TAPE_SYMBOLS: List[Tuple[str, str]] = [
     ("^GSPC", "S&P 500"),
@@ -194,15 +182,20 @@ TAPE_SYMBOLS: List[Tuple[str, str]] = [
 # Bounding boxes: (min_lat, min_lon, max_lat, max_lon)
 # Drawn generously so vessels queuing at anchorages are counted, not just
 # ships physically inside the canal.
+#
+# There is deliberately no "normal vessel count" field here. An earlier
+# version carried a hand-written one per corridor and divided the live count
+# by it to label traffic SEVERE or LIGHT - which meant the headline verdict
+# on the maritime page came from a number somebody made up, scaled by
+# whatever AIS coverage happened to be that day. The baseline is now measured
+# from this installation's own observation history (`utils/observations.py`),
+# and until enough history exists the terminal says so instead of judging.
 @dataclass(frozen=True)
 class Chokepoint:
     name: str
     code: str
     bbox: Tuple[float, float, float, float]
     description: str
-    # Rough "normal" concurrent vessel count, used to colour the congestion
-    # gauge. These are order-of-magnitude reference values, not gospel.
-    baseline_vessels: int
 
 
 CHOKEPOINTS: Dict[str, Chokepoint] = {
@@ -211,49 +204,42 @@ CHOKEPOINTS: Dict[str, Chokepoint] = {
         code="SUEZ",
         bbox=(29.20, 32.20, 31.60, 33.20),
         description="Egypt. ~12% of global trade; Red Sea <-> Mediterranean.",
-        baseline_vessels=90,
     ),
     "PANAMA": Chokepoint(
         name="Panama Canal",
         code="PANAMA",
         bbox=(8.60, -80.20, 9.65, -79.30),
         description="Atlantic <-> Pacific. Draft-limited by Gatun Lake levels.",
-        baseline_vessels=70,
     ),
     "MALACCA": Chokepoint(
         name="Strait of Malacca",
         code="MALACCA",
         bbox=(1.00, 98.50, 6.20, 104.60),
         description="Indian Ocean <-> South China Sea. ~25% of traded goods.",
-        baseline_vessels=250,
     ),
     "BABELMANDEB": Chokepoint(
         name="Bab-el-Mandeb",
         code="BABELMANDEB",
         bbox=(11.80, 42.40, 13.80, 44.20),
         description="Red Sea southern gate. Houthi threat corridor.",
-        baseline_vessels=45,
     ),
     "HORMUZ": Chokepoint(
         name="Strait of Hormuz",
         code="HORMUZ",
         bbox=(25.30, 55.20, 27.30, 57.60),
         description="~20% of global petroleum liquids consumption transits here.",
-        baseline_vessels=110,
     ),
     "BOSPHORUS": Chokepoint(
         name="Bosphorus Strait",
         code="BOSPHORUS",
         bbox=(40.90, 28.80, 41.35, 29.30),
         description="Black Sea grain & Russian crude export route.",
-        baseline_vessels=35,
     ),
     "GIBRALTAR": Chokepoint(
         name="Strait of Gibraltar",
         code="GIBRALTAR",
         bbox=(35.70, -6.10, 36.30, -5.20),
         description="Mediterranean <-> Atlantic.",
-        baseline_vessels=60,
     ),
 }
 
@@ -290,33 +276,93 @@ OPENSKY_TOKEN_URL = (
     "protocol/openid-connect/token"
 )
 
-# Named watchlists of ICAO24 hex transponder addresses.
+# Fleet watchlists, keyed by ICAO three-letter operator designator.
 #
-# NOTE ON SOURCING: these are illustrative examples of *publicly registered,
-# institutionally-owned* airframes (national carriers, cargo fleets, government
-# transports) taken from open registry data. Open-Terminal deliberately ships
-# no private-individual watchlist. Tracking a named private person's aircraft
-# raises real safety and legal issues in several jurisdictions - if you add
-# your own entries, keep them to corporate and state-operated fleets.
-AIRCRAFT_WATCHLISTS: Dict[str, Dict[str, str]] = {
-    "GOVERNMENT / STATE": {
-        "adfdf8": "USAF VC-25A  82-8000 (AF1 airframe)",
-        "adfdf9": "USAF VC-25A  92-9000 (AF1 airframe)",
-        "ae0439": "USAF C-32A    (SAM / VIP transport)",
-        "43c6e1": "RAF Voyager  ZZ336 (UK VIP)",
-        "3f8ff4": "Luftwaffe A350 (German govt)",
-    },
+# WHAT CHANGED AND WHY: this used to be a dict of specific ICAO24 hex
+# transponder addresses mapped to descriptions like "FedEx B777F" or
+# "Corporate G650 (energy sector, registry-listed)". Those labels were
+# written by hand and never verified against a registry, so the terminal was
+# asserting the identity and operator of specific airframes on no authority
+# at all - and hex assignments do change hands. The list also went stale
+# invisibly: a retired airframe simply never appears, which looks identical
+# to one parked with its transponder off.
+#
+# What is here instead is reference data rather than assertion. ICAO Doc 8585
+# three-letter designators are a published standard, and every aircraft
+# broadcasts its callsign live. Selecting a fleet now filters live state
+# vectors by callsign prefix, so the terminal reports only aircraft it can
+# currently see, labelled with the callsign they are themselves transmitting.
+#
+# Deliberately institutional only - national carriers, cargo fleets and state
+# transports. Open-Terminal ships no private-individual watchlist. Tracking a
+# named private person's aircraft raises real safety and legal issues in
+# several jurisdictions, and OpenSky's terms restrict it.
+OPERATOR_FLEETS: Dict[str, Dict[str, str]] = {
     "CARGO / FREIGHT": {
-        "a0f1bb": "FedEx B777F",
-        "a1cd7a": "UPS B747-8F",
-        "48c223": "Cargolux B747-8F",
-        "4baa8f": "Turkish Cargo A330F",
-        "76ce31": "Singapore Airlines Cargo B747F",
+        "FDX": "FedEx Express",
+        "UPS": "UPS Airlines",
+        "GTI": "Atlas Air",
+        "CLX": "Cargolux",
+        "CKS": "Kalitta Air",
+        "ABX": "ABX Air",
+        "GEC": "Lufthansa Cargo",
+        "CAO": "Air China Cargo",
+        "CKK": "China Cargo Airlines",
+        "SQC": "Singapore Airlines Cargo",
+        "MPH": "Martinair",
+        "PAC": "Polar Air Cargo",
+        "NCA": "Nippon Cargo Airlines",
+        "GSS": "Atlas Air (Giant)",
+        "BOX": "AeroLogic",
+        "TAY": "ASL Airlines Belgium",
     },
-    "ENERGY / COMMODITY CORPORATE": {
-        "a3f9d2": "Corporate G650 (energy sector, registry-listed)",
-        "a52d19": "Corporate GLEX (commodities trading house)",
+    "FLAG / MAJOR PASSENGER": {
+        "UAL": "United Airlines",
+        "AAL": "American Airlines",
+        "DAL": "Delta Air Lines",
+        "SWA": "Southwest Airlines",
+        "BAW": "British Airways",
+        "DLH": "Lufthansa",
+        "AFR": "Air France",
+        "KLM": "KLM",
+        "UAE": "Emirates",
+        "QTR": "Qatar Airways",
+        "ETD": "Etihad Airways",
+        "SIA": "Singapore Airlines",
+        "ANA": "All Nippon Airways",
+        "JAL": "Japan Airlines",
+        "CPA": "Cathay Pacific",
+        "THY": "Turkish Airlines",
+        "ETH": "Ethiopian Airlines",
+        "RYR": "Ryanair",
+        "EZY": "easyJet",
+        "IBE": "Iberia",
+        "AZA": "ITA Airways",
+        "CCA": "Air China",
+        "CES": "China Eastern",
+        "CSN": "China Southern",
+        "AIC": "Air India",
+        "QFA": "Qantas",
     },
+    "STATE / MILITARY": {
+        "RCH": "USAF Air Mobility Command (Reach)",
+        "SAM": "USAF Special Air Mission",
+        "RRR": "RAF Ascot",
+        "GAF": "German Air Force",
+        "CFC": "Canadian Forces (Canforce)",
+        "IAM": "Italian Air Force",
+        "CTM": "French Air Force transport (COTAM)",
+    },
+}
+
+# Every key above is a three-letter ICAO Doc 8585 operator designator, kept
+# short on purpose: an entry that is merely plausible is the same failure
+# this table was written to remove. Adding one means checking Doc 8585, not
+# guessing from the airline's name.
+OPERATOR_NAMES: Dict[str, str] = {
+    designator: name
+    for fleet in OPERATOR_FLEETS.values()
+    for designator, name in fleet.items()
 }
 
 # Preset map regions: (min_lat, max_lat, min_lon, max_lon)

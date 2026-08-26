@@ -208,9 +208,16 @@ class TestChokepointConfig:
             assert -90 <= min_lat <= 90 and -90 <= max_lat <= 90, code
             assert -180 <= min_lon <= 180 and -180 <= max_lon <= 180, code
 
-    def test_baselines_positive(self):
+    def test_no_hardcoded_baseline(self):
+        """
+        Congestion baselines are measured, never configured.
+
+        This guards a regression that would be invisible in the UI: a
+        plausible-looking SEVERE CONGESTION label computed against a number
+        somebody typed in rather than one the terminal observed.
+        """
         for code, cp in config.CHOKEPOINTS.items():
-            assert cp.baseline_vessels > 0, code
+            assert not hasattr(cp, "baseline_vessels"), code
 
 
 # ==========================================================================
@@ -373,9 +380,30 @@ class TestAviation:
     def test_operator_lookup(self):
         from data_fetchers import aviation
         assert aviation.identify_operator("FDX1234") == "FedEx Express"
-        assert aviation.identify_operator("UAL99") == "United"
+        assert aviation.identify_operator("UAL99") == "United Airlines"
         assert aviation.identify_operator("ZZZ1") == "UNKNOWN"
         assert aviation.identify_operator("") == "UNKNOWN"
+
+    def test_operator_lookup_has_one_source(self):
+        """
+        The designator table lives in config and nowhere else.
+
+        A second copy inside aviation.py is how the two drifted apart before:
+        the watchlist knew about operators the callsign resolver didn't.
+        """
+        from data_fetchers import aviation
+
+        for fleet in config.OPERATOR_FLEETS.values():
+            for designator, operator in fleet.items():
+                assert aviation.identify_operator(f"{designator}123") == operator
+
+    def test_designators_are_three_letters(self):
+        """Callsign matching slices [:3]; a longer key could never match."""
+        for group, fleet in config.OPERATOR_FLEETS.items():
+            for designator in fleet:
+                assert len(designator) == 3, f"{group}/{designator}"
+                assert designator.isalnum(), f"{group}/{designator}"
+                assert designator == designator.upper(), f"{group}/{designator}"
 
     def test_regions_wellformed(self):
         for name, (min_lat, max_lat, min_lon, max_lon) in config.AVIATION_REGIONS.items():
@@ -390,3 +418,72 @@ class TestAviation:
         from data_fetchers import aviation
         assert aviation.SQUAWK_ALERTS["7700"][0] == "EMERGENCY"
         assert aviation.SQUAWK_ALERTS["7600"][0] == "RADIO FAIL"
+
+
+# ==========================================================================
+# Peer selection
+# ==========================================================================
+# REGRESSION CONTEXT: comparables used to come from seven hand-written sector
+# lists, with megacap tech as the catch-all. Any ticker outside those lists -
+# a regional bank, a biotech, a utility - was silently benchmarked against
+# AAPL and NVDA, and the table of multiples looked completely normal. Peers
+# now come from the issuer's own Yahoo classification or from nowhere.
+class TestPeerSelection:
+    def _table(self, rows):
+        return pd.DataFrame(
+            [{"name": s, "market weight": w} for s, w in rows],
+            index=[s for s, _ in rows],
+        ).rename_axis("symbol")
+
+    def test_drops_focal_and_zero_weight_names(self):
+        from data_fetchers import equities
+
+        table = self._table([("AAPL", 0.2), ("MSFT", 0.15),
+                             ("DEAD", 0.0), ("NVDA", 0.1)])
+        assert equities._peers_from(table, "AAPL", 6) == ["MSFT", "NVDA"]
+
+    def test_respects_max_peers(self):
+        from data_fetchers import equities
+
+        table = self._table([(f"P{i}", 0.1) for i in range(10)])
+        assert len(equities._peers_from(table, "FOCAL", 3)) == 3
+
+    def test_no_config_peer_groups_remain(self):
+        """
+        The hand-written sector lists must not come back.
+
+        They were seductive because they always returned something. That is
+        exactly the failure: a peer set is either derived from this issuer's
+        classification or it does not exist.
+        """
+        assert not hasattr(config, "PEER_GROUPS")
+
+    def test_dominant_issuer_falls_through_to_sector(self, monkeypatch):
+        """
+        Apple is 99.9% of Yahoo's consumer-electronics industry; its
+        "peers" there are microcaps. Comparing against them is arithmetic,
+        not analysis, so the sector is used instead.
+        """
+        from data_fetchers import equities
+
+        industry = self._table([("AAPL", 0.999), ("TINY", 0.0004)])
+        sector = self._table([("NVDA", 0.18), ("AAPL", 0.16), ("MSFT", 0.13)])
+
+        monkeypatch.setattr(equities, "YFINANCE_AVAILABLE", True)
+        monkeypatch.setattr(equities, "get_company_info",
+                            lambda t: {"industryKey": "ce", "sectorKey": "tech"})
+        monkeypatch.setattr(
+            equities, "_constituents",
+            lambda kind, key: industry if kind == "Industry" else sector)
+
+        assert equities.suggest_peers.__wrapped__("AAPL") == [
+            "AAPL", "NVDA", "MSFT"]
+
+    def test_returns_bare_ticker_when_unclassified(self, monkeypatch):
+        from data_fetchers import equities
+
+        monkeypatch.setattr(equities, "YFINANCE_AVAILABLE", True)
+        monkeypatch.setattr(equities, "get_company_info", lambda t: {})
+        monkeypatch.setattr(equities, "_constituents", lambda kind, key: None)
+
+        assert equities.suggest_peers.__wrapped__("OBSCURE") == ["OBSCURE"]

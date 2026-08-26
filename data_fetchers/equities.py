@@ -1032,30 +1032,99 @@ def get_peer_comparison(tickers: List[str]) -> pd.DataFrame:
     return df
 
 
+# Above this share of its own industry's market weight, a company IS the
+# industry - Apple is 99.9% of Yahoo's "consumer-electronics" - and the other
+# constituents are microcaps that make a nonsense comparables table. The
+# classification one level up is then the honest comparison. The test is on
+# published weights, not on a list of which companies are "too big".
+_INDUSTRY_DOMINANCE_CEILING = 0.5
+
+
+def _constituents(kind: str, classification: Optional[str]):
+    """
+    Yahoo's constituent table for one industry or sector key, or None.
+
+    `kind` is "Industry" or "Sector" - the yfinance class to instantiate.
+    """
+    if not classification:
+        return None
+    try:
+        table = getattr(yf, kind)(classification).top_companies
+    except Exception as exc:
+        log.warning("%s constituents unavailable for %s: %s",
+                    kind, classification, exc)
+        return None
+
+    if table is None or getattr(table, "empty", True):
+        return None
+    return table
+
+
+def _peers_from(table, ticker: str, max_peers: int) -> List[str]:
+    """Constituent symbols by descending market weight, focal name dropped."""
+    peers: List[str] = []
+    weights = (table["market weight"] if "market weight" in table.columns
+               else None)
+
+    for symbol in table.index:
+        symbol = str(symbol).upper()
+        if symbol == ticker or symbol in peers:
+            continue
+        # A zero-weight constituent is delisted or untraded, not a comparable.
+        if weights is not None and not (float(weights.get(symbol) or 0.0) > 0):
+            continue
+        peers.append(symbol)
+        if len(peers) >= max_peers:
+            break
+    return peers
+
+
+@cached(ttl=config.TTL.fundamentals, namespace="equity_peers")
 def suggest_peers(ticker: str, max_peers: int = 6) -> List[str]:
     """
-    Pick a reasonable peer set: the configured group containing the ticker,
-    else other names in the same sector from the configured groups.
+    Comparables drawn from the issuer's own Yahoo classification.
+
+    Yahoo assigns each listed company an `industryKey` and a `sectorKey` and
+    publishes each one's constituents with market weights. Both describe this
+    specific company; neither is a guess. The industry is preferred, except
+    where the company dominates it (see `_INDUSTRY_DOMINANCE_CEILING`), in
+    which case the sector is used instead.
+
+    This used to consult seven hand-written sector lists in config and, for
+    anything that matched none of them, fall through to megacap tech - so a
+    regional bank or a biotech was quietly compared against AAPL and NVDA.
+    The multiples rendered fine and meant nothing.
+
+    Returns:
+        [ticker, *peers]. Just [ticker] when neither classification yields a
+        usable constituent list: the comparables table then reports that it
+        has no peers rather than inventing some.
     """
     ticker = normalize_ticker(ticker).upper()
+    if not YFINANCE_AVAILABLE:
+        return [ticker]
 
-    for members in config.PEER_GROUPS.values():
-        if ticker in members:
-            peers = [t for t in members if t != ticker]
-            return [ticker] + peers[: max_peers - 1]
+    info = get_company_info(ticker) or {}
+    wanted = max(max_peers - 1, 0)
 
-    # Not in a preset group: match on sector via the company profile.
-    try:
-        sector = (get_company_info(ticker) or {}).get("sector")
-        if sector:
-            for members in config.PEER_GROUPS.values():
-                probe = get_company_info(members[0]) or {}
-                if probe.get("sector") == sector:
-                    return [ticker] + members[: max_peers - 1]
-    except Exception:
-        pass
+    industry = _constituents("Industry", info.get("industryKey"))
+    if industry is not None:
+        own_weight = 0.0
+        if "market weight" in industry.columns:
+            own_weight = float(industry["market weight"].get(ticker) or 0.0)
 
-    return [ticker] + config.PEER_GROUPS["megacap_tech"][: max_peers - 1]
+        if own_weight < _INDUSTRY_DOMINANCE_CEILING:
+            peers = _peers_from(industry, ticker, wanted)
+            if peers:
+                return [ticker] + peers
+
+    sector = _constituents("Sector", info.get("sectorKey"))
+    if sector is not None:
+        peers = _peers_from(sector, ticker, wanted)
+        if peers:
+            return [ticker] + peers
+
+    return [ticker]
 
 
 # ==========================================================================

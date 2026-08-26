@@ -271,41 +271,57 @@ def get_states_by_region(region: str = "GLOBAL") -> pd.DataFrame:
 # ==========================================================================
 # WATCHLIST TRACKING
 # ==========================================================================
-def track_watchlist(watchlist: Optional[str] = None) -> pd.DataFrame:
+def track_watchlist(
+    watchlist: Optional[str] = None, region: str = "GLOBAL"
+) -> pd.DataFrame:
     """
-    Positions for the configured fleets of interest.
+    Live positions for a fleet, resolved from the callsigns being broadcast.
 
-    OpenSky's icao24 filter accepts many addresses in one request, so an
-    entire watchlist costs a single API credit.
+    The earlier version queried a hand-written list of ICAO24 hex addresses
+    labelled with airframe descriptions nobody had verified. This asks the
+    opposite question - of everything currently transmitting in `region`,
+    which callsigns belong to the operators in this fleet - so every row is
+    an aircraft OpenSky can see right now, wearing the callsign it is itself
+    broadcasting.
 
     Args:
-        watchlist: Key of config.AIRCRAFT_WATCHLISTS, or None for all of them.
+        watchlist: Key of config.OPERATOR_FLEETS, or None for every fleet.
+        region:    Key of config.AVIATION_REGIONS. GLOBAL costs roughly 4x
+                   the API credits of a bounded region.
 
     Returns:
-        DataFrame of airborne/tracked aircraft plus `watchlist` and `label`
-        columns. Aircraft that are parked with transponders off simply don't
-        appear - absence of a row is not evidence the aircraft doesn't exist.
+        Every state-vector column plus `watchlist` (fleet name) and
+        `operator` (the designator's registered operator). Empty when no
+        matching aircraft are airborne - absence of a row means nothing was
+        transmitting in that box, not that the fleet is grounded.
     """
     if watchlist:
-        groups = {watchlist: config.AIRCRAFT_WATCHLISTS.get(watchlist, {})}
+        fleets = {watchlist: config.OPERATOR_FLEETS.get(watchlist, {})}
     else:
-        groups = config.AIRCRAFT_WATCHLISTS
+        fleets = config.OPERATOR_FLEETS
 
-    label_map: Dict[str, Tuple[str, str]] = {}
-    for group_name, entries in groups.items():
-        for hex_code, label in entries.items():
-            label_map[hex_code.lower()] = (group_name, label)
+    designators: Dict[str, Tuple[str, str]] = {}
+    for fleet_name, members in fleets.items():
+        for designator, operator in members.items():
+            designators[designator.upper()] = (fleet_name, operator)
 
-    if not label_map:
+    if not designators:
         return pd.DataFrame()
 
-    df = get_states(icao24=tuple(sorted(label_map)))
-    if df.empty:
-        return df
+    df = get_states_by_region(region)
+    if df.empty or "callsign" not in df.columns:
+        return pd.DataFrame()
 
-    df["watchlist"] = df["icao24"].map(lambda h: label_map.get(h, ("", ""))[0])
-    df["label"] = df["icao24"].map(lambda h: label_map.get(h, ("", ""))[1])
-    return df
+    prefixes = df["callsign"].fillna("").astype(str).str.strip().str.upper().str[:3]
+    matched = prefixes.isin(designators)
+    if not matched.any():
+        return pd.DataFrame()
+
+    out = df[matched].copy()
+    hits = prefixes[matched]
+    out["watchlist"] = hits.map(lambda p: designators[p][0])
+    out["operator"] = hits.map(lambda p: designators[p][1])
+    return out.sort_values(["watchlist", "operator", "callsign"])
 
 
 @cached(ttl=300, namespace="opensky_track")
@@ -497,33 +513,20 @@ def identify_operator(callsign: str) -> str:
     """
     Map a callsign prefix to its operator.
 
-    Callsigns follow ICAO 3-letter designators (FDX1234 = FedEx). Covers the
-    freight and flag carriers most relevant to trade-flow analysis.
+    Callsigns follow ICAO Doc 8585 three-letter designators (FDX1234 =
+    FedEx). The lookup is `config.OPERATOR_NAMES`, the same table the fleet
+    watchlists are built from - there is one designator list in this
+    codebase, not two that can drift apart.
+
+    Returns "UNKNOWN" for anything not in it. That covers most of the sky and
+    is the correct answer: a partial reference table must not be padded out
+    by inferring an operator from the letters.
     """
     if not callsign:
         return "UNKNOWN"
 
     prefix = str(callsign).strip().upper()[:3]
-    operators = {
-        # Freight
-        "FDX": "FedEx Express", "UPS": "UPS Airlines", "GTI": "Atlas Air",
-        "CLX": "Cargolux", "CKS": "Kalitta Air", "ABX": "ABX Air",
-        "GEC": "Lufthansa Cargo", "CAO": "Air China Cargo",
-        "CKK": "China Cargo", "SQC": "Singapore Cargo", "MPH": "Martinair",
-        "PAC": "Polar Air Cargo", "NCA": "Nippon Cargo", "ETH": "Ethiopian",
-        # Flag / major passenger
-        "UAL": "United", "AAL": "American", "DAL": "Delta",
-        "SWA": "Southwest", "BAW": "British Airways", "DLH": "Lufthansa",
-        "AFR": "Air France", "KLM": "KLM", "UAE": "Emirates",
-        "QTR": "Qatar Airways", "SIA": "Singapore Airlines",
-        "ANA": "All Nippon", "JAL": "Japan Airlines", "CPA": "Cathay Pacific",
-        "THY": "Turkish Airlines", "RYR": "Ryanair", "EZY": "easyJet",
-        # State / military
-        "RCH": "USAF Air Mobility (Reach)", "SAM": "USAF Special Air Mission",
-        "AF1": "US Air Force One", "RRR": "RAF Ascot", "GAF": "German Air Force",
-        "CFC": "Canadian Forces", "IAM": "Italian Air Force",
-    }
-    return operators.get(prefix, "UNKNOWN")
+    return config.OPERATOR_NAMES.get(prefix, "UNKNOWN")
 
 
 def add_operator_column(df: pd.DataFrame) -> pd.DataFrame:

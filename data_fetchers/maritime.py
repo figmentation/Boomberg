@@ -52,6 +52,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import pandas as pd
 
 import config
+from utils import observations
 from utils.cache import cached, get_session
 from utils.rate_limiter import retry_with_backoff, throttled
 
@@ -810,6 +811,59 @@ def track_vessel(identifier: str, stream_seconds: float = 30.0) -> Dict[str, Any
 # ==========================================================================
 # CHOKEPOINT TRACKER
 # ==========================================================================
+def congestion_series(code: str, source: str) -> str:
+    """Observation-store key for one corridor as seen through one source."""
+    return f"chokepoint.vessels.{code.upper()}.{source or 'none'}"
+
+
+def _congestion(code: str, source: str, total: int) -> Dict[str, Any]:
+    """
+    Record this reading, then judge it against the corridor's own history.
+
+    Returns the baseline/ratio/status fields for `get_chokepoint_status`.
+    Every path here is honest about what it knows: with too little history
+    the status is MEASURING and `congestion_ratio` is None.
+    """
+    series = congestion_series(code, source)
+    store = observations.get_store()
+
+    # Record before reading, so the very first sample starts the history.
+    store.record(series, total)
+
+    reference = store.baseline(series)
+    if reference is None:
+        collected = store.sample_count(series)
+        needed = observations.MIN_SAMPLES
+        return {
+            "baseline_vessels": None,
+            "baseline_samples": collected,
+            "baseline_note": (
+                f"Baseline still building: {collected} of {needed} readings "
+                f"for {code} via {source or 'no source'}. Congestion is scored "
+                "against this terminal's own observation history, so it needs "
+                "a history first."
+            ),
+            "congestion_ratio": None,
+            "status": f"MEASURING ({collected}/{needed})",
+        }
+
+    ratio = total / max(reference.median, 1.0)
+    return {
+        "baseline_vessels": round(reference.median, 1),
+        "baseline_samples": reference.samples,
+        "baseline_note": f"Baseline from {reference.provenance()}.",
+        "baseline_low": reference.low,
+        "baseline_high": reference.high,
+        "congestion_ratio": round(ratio, 2),
+        "status": (
+            "SEVERE CONGESTION" if ratio >= 1.6
+            else "ELEVATED" if ratio >= 1.25
+            else "NORMAL" if ratio >= 0.6
+            else "LIGHT TRAFFIC"
+        ),
+    }
+
+
 def get_chokepoint_status(
     chokepoint_code: str, stream_seconds: float = 20.0
 ) -> Dict[str, Any]:
@@ -819,13 +873,21 @@ def get_chokepoint_status(
     Computes:
       * total vessel count in the corridor bbox
       * how many are anchored/moored (the queue) vs under way (the flow)
-      * a congestion ratio versus the configured baseline
+      * a congestion ratio versus this installation's *measured* baseline
       * fleet composition by ship type
       * mean draught, a proxy for whether transits are laden or in ballast
 
+    On the baseline: it is the median of the counts this terminal has itself
+    observed for this corridor on this source, not a figure typed into a
+    config file. Until `observations.MIN_SAMPLES` readings exist the status
+    is MEASURING and no ratio is reported - a congestion verdict computed
+    against a guessed denominator is worse than no verdict.
+
     Interpretation caveat: counts depend entirely on AIS coverage in that
     box. A low count can mean light traffic OR poor receiver coverage. The
-    `coverage_note` field records which.
+    `coverage_note` field records which. The baseline is keyed by source for
+    the same reason: a local SDR and a global websocket see different
+    fractions of the same traffic, and their counts are not comparable.
     """
     chokepoint = config.CHOKEPOINTS.get(chokepoint_code.upper())
     if not chokepoint:
@@ -839,7 +901,6 @@ def get_chokepoint_status(
         "name": chokepoint.name,
         "description": chokepoint.description,
         "bbox": chokepoint.bbox,
-        "baseline_vessels": chokepoint.baseline_vessels,
         "source": source,
         "timestamp": datetime.now(timezone.utc),
         "vessels": df,
@@ -870,15 +931,8 @@ def get_chokepoint_status(
         out["anchored_count"] = int(slow.sum())
         out["underway_count"] = int((~slow).sum())
 
-    # Congestion index vs baseline.
-    ratio = total / max(chokepoint.baseline_vessels, 1)
-    out["congestion_ratio"] = round(ratio, 2)
-    out["status"] = (
-        "SEVERE CONGESTION" if ratio >= 1.6
-        else "ELEVATED" if ratio >= 1.25
-        else "NORMAL" if ratio >= 0.6
-        else "LIGHT TRAFFIC"
-    )
+    # Congestion index vs the measured baseline.
+    out.update(_congestion(chokepoint.code, source, total))
 
     # Fleet mix.
     if "ship_type" in df.columns:
@@ -926,6 +980,7 @@ def get_all_chokepoints(stream_seconds: float = 12.0) -> pd.DataFrame:
                 "Tankers": status.get("tanker_count"),
                 "Cargo": status.get("cargo_count"),
                 "Baseline": status.get("baseline_vessels"),
+                "Obs": status.get("baseline_samples"),
                 "Congestion": status.get("congestion_ratio"),
                 "Status": status.get("status", "NO DATA"),
                 "Mean Draught (m)": status.get("mean_draught_m"),

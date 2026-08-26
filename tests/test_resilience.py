@@ -424,3 +424,132 @@ class TestCacheEntry:
         assert CacheEntry("v", now - 300, now + 60, False).age_label().endswith("m ago")
         assert CacheEntry("v", now - 7200, now + 60, False).age_label().endswith("h ago")
         assert CacheEntry("v", now - 200000, now + 60, False).age_label().endswith("d ago")
+
+
+# ==========================================================================
+# Observation store
+# ==========================================================================
+# REGRESSION CONTEXT: chokepoint congestion used to be scored against a
+# hand-written "normal vessel count" per corridor. The gauge looked
+# authoritative and the denominator was invented. These tests guard the
+# replacement - a baseline measured from this installation's own readings,
+# which must refuse to produce a number until it actually has evidence.
+class TestObservationStore:
+    def _store(self, tmp_path):
+        from utils.observations import ObservationStore
+
+        return ObservationStore(path=str(tmp_path / "obs.sqlite"))
+
+    def test_baseline_is_none_below_minimum(self, tmp_path):
+        from utils.observations import MIN_SAMPLES
+
+        store = self._store(tmp_path)
+        now = time.time()
+        for i in range(MIN_SAMPLES - 1):
+            store.record("s", 100, at=now - i * 7200)
+
+        assert store.baseline("s") is None, "a guess is worse than no answer"
+
+    def test_baseline_appears_at_minimum(self, tmp_path):
+        from utils.observations import MIN_SAMPLES
+
+        store = self._store(tmp_path)
+        now = time.time()
+        for i in range(MIN_SAMPLES):
+            store.record("s", 100 + i, at=now - i * 7200)
+
+        reference = store.baseline("s")
+        assert reference is not None
+        assert reference.samples == MIN_SAMPLES
+        assert reference.low <= reference.median <= reference.high
+
+    def test_median_resists_an_outage_reading(self, tmp_path):
+        """One zero-vessel AIS outage must not redefine 'normal'."""
+        store = self._store(tmp_path)
+        now = time.time()
+        for i in range(20):
+            store.record("s", 0 if i == 7 else 100, at=now - i * 7200)
+
+        assert store.baseline("s").median == 100
+
+    def test_repeat_reads_are_throttled(self, tmp_path):
+        """Re-rendering a page must not stuff the history with one moment."""
+        store = self._store(tmp_path)
+        now = time.time()
+        assert store.record("s", 50, at=now) is True
+        assert store.record("s", 50, at=now + 5) is False
+        assert store.record("s", 50, at=now + 60) is False
+        assert store.record("s", 50, at=now + 3600) is True
+        assert store.sample_count("s") == 2
+
+    def test_stale_samples_fall_out_of_the_window(self, tmp_path):
+        store = self._store(tmp_path)
+        now = time.time()
+        for i in range(30):
+            store.record("s", 100, at=now - (200 + i) * 86400)
+
+        assert store.history("s") == []
+        assert store.baseline("s") is None
+
+    def test_series_are_independent(self, tmp_path):
+        store = self._store(tmp_path)
+        now = time.time()
+        for i in range(20):
+            store.record("a", 10, at=now - i * 7200)
+        store.record("b", 999, at=now)
+
+        assert store.baseline("a").median == 10
+        assert store.baseline("b") is None
+
+    def test_non_numeric_is_rejected(self, tmp_path):
+        store = self._store(tmp_path)
+        assert store.record("s", None) is False
+        assert store.record("s", "many") is False
+        assert store.sample_count("s") == 0
+
+
+class TestMeasuredCongestion:
+    def test_status_is_measuring_without_history(self, tmp_path, monkeypatch):
+        from data_fetchers import maritime
+        from utils import observations
+
+        store = observations.ObservationStore(path=str(tmp_path / "obs.sqlite"))
+        monkeypatch.setattr(observations, "_store_singleton", store)
+
+        out = maritime._congestion("SUEZ", "aisstream", 140)
+        assert out["congestion_ratio"] is None
+        assert out["baseline_vessels"] is None
+        assert out["status"].startswith("MEASURING")
+
+    def test_ratio_uses_observed_median(self, tmp_path, monkeypatch):
+        from data_fetchers import maritime
+        from utils import observations
+
+        store = observations.ObservationStore(path=str(tmp_path / "obs.sqlite"))
+        monkeypatch.setattr(observations, "_store_singleton", store)
+
+        series = maritime.congestion_series("SUEZ", "aisstream")
+        now = time.time()
+        for i in range(20):
+            store.record(series, 100, at=now - (i + 1) * 7200)
+
+        out = maritime._congestion("SUEZ", "aisstream", 200)
+        assert out["baseline_vessels"] == 100
+        assert out["congestion_ratio"] == 2.0
+        assert out["status"] == "SEVERE CONGESTION"
+
+    def test_sources_do_not_share_a_baseline(self, tmp_path, monkeypatch):
+        """A local SDR and a global feed see different fractions of the same
+        traffic; pooling their counts would fabricate congestion."""
+        from data_fetchers import maritime
+        from utils import observations
+
+        store = observations.ObservationStore(path=str(tmp_path / "obs.sqlite"))
+        monkeypatch.setattr(observations, "_store_singleton", store)
+
+        series = maritime.congestion_series("SUEZ", "aisstream")
+        now = time.time()
+        for i in range(20):
+            store.record(series, 100, at=now - (i + 1) * 7200)
+
+        assert maritime._congestion("SUEZ", "local_sdr", 5)["baseline_vessels"] is None

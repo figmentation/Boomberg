@@ -715,7 +715,14 @@ def page_equity() -> None:
 
     # ---- PEERS -----------------------------------------------------------
     with tabs[3]:
-        default_peers = equities.suggest_peers(ticker)
+        default_peers = _safe(equities.suggest_peers, ticker, default=[ticker])
+        if len(default_peers) <= 1:
+            ui.alert(
+                f"No comparables derived for {ticker}. Yahoo publishes no "
+                "industry or sector constituent list for it, and the terminal "
+                "does not assert peers it cannot source — type your own set "
+                "below.", "warn",
+            )
         peer_input = st.text_input(
             "PEER SET (comma-separated)",
             value=", ".join(default_peers), key="peer_input",
@@ -735,9 +742,12 @@ def page_equity() -> None:
                                        "Oper Mgn %", "Gross Mgn %"],
                 )
                 st.caption(
-                    "Multiples from Yahoo Finance. A negative or blank P/E "
-                    "means trailing losses. EV/EBITDA is generally the more "
-                    "comparable multiple across capital structures."
+                    "Default peers are the constituents of this issuer's own "
+                    "industry classification, ranked by market weight — not a "
+                    "hand-written sector list. Multiples from Yahoo Finance. A "
+                    "negative or blank P/E means trailing losses. EV/EBITDA is "
+                    "generally the more comparable multiple across capital "
+                    "structures."
                 )
 
     # ---- OPTIONS ---------------------------------------------------------
@@ -1287,7 +1297,7 @@ def page_maritime() -> None:
                 ui.alert(status.get("coverage_note",
                                     "No vessels observed in this corridor."), "warn")
             else:
-                congestion = status.get("congestion_ratio", 0)
+                congestion = status.get("congestion_ratio")
                 status_color = {
                     "SEVERE CONGESTION": THEME.red, "ELEVATED": THEME.amber,
                     "NORMAL": THEME.green, "LIGHT TRAFFIC": THEME.cyan,
@@ -1302,11 +1312,17 @@ def page_maritime() -> None:
                                    subtitle="flow", value_format="{:,.0f}"),
                     ui.metric_tile("TANKERS", status.get("tanker_count"),
                                    value_format="{:,.0f}", accent=THEME.amber),
-                    ui.metric_tile("CONGESTION", congestion, subtitle="× baseline",
-                                   value_format="{:.2f}", accent=status_color),
+                    ui.metric_tile(
+                        "CONGESTION", congestion,
+                        subtitle=("× measured baseline" if congestion is not None
+                                  else "baseline building"),
+                        value_format="{:.2f}", accent=status_color),
                     ui.metric_tile("MEAN DRAUGHT", status.get("mean_draught_m"),
                                    subtitle="m — laden proxy"),
                 ], columns=6)
+
+                if status.get("baseline_note"):
+                    st.caption(status["baseline_note"])
 
                 vessels = status.get("vessels", pd.DataFrame())
 
@@ -1582,46 +1598,59 @@ def page_aviation() -> None:
     # ---- WATCHLIST -------------------------------------------------------
     with tabs[1]:
         st.caption(
-            "Institutional airframes only — national carriers, cargo fleets "
-            "and state transports drawn from public registries. Open-Terminal "
-            "ships no private-individual watchlist; sustained tracking of a "
-            "named person's aircraft is treated very differently in law from "
+            "Fleets are matched on the ICAO operator designator each aircraft "
+            "is broadcasting in its callsign, so every row is something "
+            "OpenSky can see right now — no stored list of airframe "
+            "identities. Institutional operators only: Open-Terminal ships no "
+            "private-individual watchlist; sustained tracking of a named "
+            "person's aircraft is treated very differently in law from "
             "fleet-level analysis, and OpenSky's terms restrict it."
         )
 
-        watchlist = st.selectbox("WATCHLIST",
-                                 ["ALL"] + list(config.AIRCRAFT_WATCHLISTS),
-                                 key="av_watchlist")
+        wl_col, region_col = st.columns(2)
+        with wl_col:
+            watchlist = st.selectbox("FLEET",
+                                     ["ALL"] + list(config.OPERATOR_FLEETS),
+                                     key="av_watchlist")
+        with region_col:
+            wl_region = st.selectbox("SEARCH REGION",
+                                     list(config.AVIATION_REGIONS),
+                                     key="av_wl_region")
 
         if st.button("QUERY WATCHLIST", use_container_width=True):
-            with st.spinner("Querying transponder addresses…"):
+            with st.spinner(f"Matching live callsigns over {wl_region}…"):
                 tracked = _safe(aviation.track_watchlist,
                                 None if watchlist == "ALL" else watchlist,
+                                wl_region,
                                 default=pd.DataFrame())
 
             if tracked.empty:
                 ui.alert(
-                    "No watchlist aircraft are currently transmitting. This is "
-                    "normal — most of these airframes are parked with "
-                    "transponders off most of the time. Absence of a signal "
-                    "is not evidence of anything.", "warn",
+                    f"No aircraft from this fleet are transmitting over "
+                    f"{wl_region} right now. Try a wider region — absence of "
+                    "a signal is not evidence of anything.", "warn",
                 )
             else:
                 st.success(f"{len(tracked)} aircraft transmitting")
                 ui.render_chart(maps.flight_map(tracked, "WATCHLIST POSITIONS",
                                                 show_labels=True))
-                columns = [c for c in ("label", "callsign", "icao24", "watchlist",
-                                       "altitude_ft", "speed_kts", "phase",
-                                       "origin_country")
+                columns = [c for c in ("operator", "callsign", "icao24",
+                                       "watchlist", "altitude_ft", "speed_kts",
+                                       "phase", "origin_country")
                            if c in tracked.columns]
                 ui.styled_table(tracked[columns])
 
-        with st.expander("CONFIGURED AIRFRAMES"):
-            for group, entries in config.AIRCRAFT_WATCHLISTS.items():
+        with st.expander("FLEET DESIGNATORS"):
+            st.caption(
+                "ICAO Doc 8585 three-letter operator designators. These are a "
+                "published standard, not an inventory — the aircraft behind "
+                "each one are whatever is airborne at query time."
+            )
+            for group, entries in config.OPERATOR_FLEETS.items():
                 st.markdown(f"**{group}**")
                 st.dataframe(
                     pd.DataFrame(list(entries.items()),
-                                 columns=["ICAO24", "Description"]),
+                                 columns=["Designator", "Operator"]),
                     use_container_width=True, hide_index=True,
                 )
 
@@ -2144,8 +2173,8 @@ def page_help() -> None:
 | Module | Command | What it does |
 |---|---|---|
 | **Equity** | `AAPL EQUITY` | Candles + EMA/RSI/MACD, XBRL statements from SEC EDGAR, peer comps, options chain, ticker news |
-| **Maritime** | `SUEZ SHIP` | AIS positions, chokepoint congestion, vessel lookup by MMSI/IMO |
-| **Aviation** | `EUROPE FLY` | Live ADS-B state vectors, fleet watchlists, aircraft tracks, airport flow |
+| **Maritime** | `SUEZ SHIP` | AIS positions, chokepoint congestion vs locally measured baselines, vessel lookup by MMSI/IMO |
+| **Aviation** | `EUROPE FLY` | Live ADS-B state vectors, fleet tracking by ICAO designator, aircraft tracks, airport flow |
 | **Macro** | `YCRV` | Treasury curve + inversion detection, recession composite, FRED series, World Bank |
 | **News** | `NEWS` | RSS aggregation with sentiment, GDELT OSINT sweeps, trending terms |
         """)

@@ -401,7 +401,14 @@ def get_session(name: str = "default", expire_after: int = 900,
 
 
 def clear_all_caches() -> Dict[str, int]:
-    """Nuke both layers. Wired to the sidebar's PURGE CACHE button."""
+    """
+    Nuke both layers. Wired to the sidebar's PURGE CACHE button.
+
+    Deliberately does not touch the `observations` table that shares this
+    database. Cached values are re-fetchable in seconds; measured baselines
+    take weeks to accumulate, and clearing them would silently reset every
+    congestion gauge to MEASURING.
+    """
     removed = {"objects": get_cache().clear()}
 
     with _session_lock:

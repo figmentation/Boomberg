@@ -9,6 +9,11 @@ from utils.cache import (
     get_session,
     make_key,
 )
+from utils.observations import (
+    Baseline,
+    ObservationStore,
+    get_store,
+)
 from utils.rate_limiter import (
     RateLimiter,
     RateLimitExceeded,
@@ -22,6 +27,7 @@ from utils.rate_limiter import (
 __all__ = [
     "CacheEntry", "SQLiteCache", "cached", "clear_all_caches", "get_cache",
     "get_session", "make_key",
+    "Baseline", "ObservationStore", "get_store",
     "RateLimiter", "RateLimitExceeded", "UpstreamUnavailable",
     "bucket_status", "get_limiter", "retry_with_backoff", "throttled",
 ]

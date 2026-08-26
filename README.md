@@ -22,10 +22,10 @@ runs — headlines just score `+0.00` across the board. See
 
 | Module | Command | Capability |
 |---|---|---|
-| **Equity** | `AAPL EQUITY` | Candlesticks + EMA/RSI/MACD/Bollinger/ATR, as-reported financials from SEC XBRL, peer comparables, options chains, per-ticker news |
+| **Equity** | `AAPL EQUITY` | Candlesticks + EMA/RSI/MACD/Bollinger/ATR, as-reported financials from SEC XBRL, comparables from the issuer's own industry classification, options chains, per-ticker news |
 | **Macro** | `YCRV` | Full 11-tenor Treasury curve, inversion detection, composite recession score, FRED series browser, World Bank cross-country data |
-| **Maritime** | `SUEZ SHIP` | AIS vessel positions, 7 chokepoint congestion monitors, MMSI/IMO lookup, custom area scans |
-| **Aviation** | `EUROPE FLY` | Live ADS-B state vectors, fleet watchlists, aircraft tracks, airport throughput |
+| **Maritime** | `SUEZ SHIP` | AIS vessel positions, 7 chokepoint congestion monitors scored against locally measured baselines, MMSI/IMO lookup, custom area scans |
+| **Aviation** | `EUROPE FLY` | Live ADS-B state vectors, fleet tracking by ICAO operator designator, aircraft tracks, airport throughput |
 | **News** | `NEWS` | 21 RSS feeds + GDELT, sentiment scoring, trending-term extraction |
 
 Command bar accepts Bloomberg-style syntax: `<SUBJECT> <FUNCTION>`. Type `HELP`
@@ -63,7 +63,7 @@ SEC_USER_AGENT=Open-Terminal/1.0 (research; you@example.com)
 
 ```
 app.py                  Streamlit entry point, command parser, routing
-config.py               Credentials, TTLs, chokepoints, feeds, watchlists
+config.py               Credentials, TTLs, chokepoints, feeds, designators
 data_fetchers/
   equities.py           yfinance + SEC EDGAR XBRL + indicators
   macro.py              FRED (3-tier fallback) + World Bank + curve analysis
@@ -77,7 +77,38 @@ ui/
 utils/
   cache.py              SQLite TTL cache + requests-cache sessions
   rate_limiter.py       Backoff, token buckets, circuit breakers
+  observations.py       Append-only local series -> measured baselines
 ```
+
+### Nothing is asserted that can't be sourced
+
+Every number on screen traces to a fetch, a filing or this installation's own
+measurements. That is a constraint the code is written around, not a slogan,
+and three places used to break it:
+
+- **Chokepoint congestion** was scored against a hand-written "normal vessel
+  count" per corridor. The gauge read SEVERE or LIGHT off a denominator
+  somebody had guessed. Baselines are now the median of the counts this
+  terminal has itself recorded for that corridor *on that source* — a local
+  SDR and a global websocket see different fractions of the same traffic, so
+  they never share a baseline. Below 12 readings the status is `MEASURING
+  (n/12)` and no ratio is shown.
+- **Equity comparables** fell back to a megacap-tech list for any ticker that
+  matched none of seven hardcoded sector groups, so a regional bank was
+  benchmarked against NVDA. Peers now come from the issuer's own Yahoo
+  industry classification, ranked by market weight — or from its sector where
+  the company *is* its industry (Apple is 99.9% of "consumer electronics", so
+  that list is five microcaps). When neither classification resolves, the
+  table says so and asks you for a peer set.
+- **Aviation watchlists** were specific ICAO24 hex addresses labelled by hand
+  ("FedEx B777F"), unverified against any registry and stale the moment an
+  airframe changed hands. Fleets are now ICAO Doc 8585 operator designators
+  matched against the callsigns aircraft are broadcasting live, so a row
+  exists only for something OpenSky can currently see.
+
+The pattern in each case: where a free authoritative source exists, use it;
+where one doesn't, measure it locally and show the sample count; where neither
+is possible, render nothing and say why. An empty panel is a finding.
 
 ### Resilience
 
@@ -99,7 +130,7 @@ Free data sources fail constantly. Three layers handle it:
 ## Tests
 
 ```bash
-pytest                # 186 offline tests, ~3s
+pytest                # 203 offline tests, ~3s
 pytest -m network     # 6 live tests against SEC EDGAR
 pytest -m "" -q       # everything
 ```
@@ -112,8 +143,8 @@ outage trains you to ignore failures.
 |---|---|
 | `test_indicators.py` | RSI/ATR against a textbook Wilder loop, EMA/MACD/Bollinger identities, empty and short-frame edges |
 | `test_xbrl.py` | SEC period labelling, duration/form filtering, restatements, live accounting identities |
-| `test_resilience.py` | Circuit breaker states and fail-fast timing, retry/backoff, token bucket, cache TTL and stale-on-error |
-| `test_domain.py` | Command parser, ticker normalisation, AIS sentinels and MMSI flags, yield-curve analysis, sentiment |
+| `test_resilience.py` | Circuit breaker states and fail-fast timing, retry/backoff, token bucket, cache TTL and stale-on-error, measured congestion baselines |
+| `test_domain.py` | Command parser, ticker normalisation, AIS sentinels and MMSI flags, yield-curve analysis, sentiment, derived peer selection |
 
 The two indicator/XBRL files are **regression suites, not coverage padding**.
 Both bugs they guard were invisible in the UI — the chart drew a plausible
@@ -202,12 +233,12 @@ For maritime data the genuinely better options are a free aisstream.io key, or a
 ~$25 RTL-SDR dongle running `rtl_ais` — your own antenna, no rate limits, no
 terms of service, sub-second latency.
 
-The aviation watchlists ship institutional airframes only: national carriers,
-cargo fleets, government transports from public registries. Aircraft positions
-are broadcast unencrypted and are legally receivable, but sustained tracking of
-a *named private individual's* aircraft is treated very differently in law
-across jurisdictions and is restricted by OpenSky's own terms. Nothing stops you
-adding entries; think about that one first.
+The aviation fleets ship institutional operators only: national carriers, cargo
+fleets, government transports, identified by their published ICAO designators.
+Aircraft positions are broadcast unencrypted and are legally receivable, but
+sustained tracking of a *named private individual's* aircraft is treated very
+differently in law across jurisdictions and is restricted by OpenSky's own
+terms. Nothing stops you adding designators; think about that one first.
 
 ---
 
