@@ -26,6 +26,7 @@ import numpy as np
 import pandas as pd
 
 import config
+from utils import macro_analytics
 from utils.cache import cached, get_session
 from utils.rate_limiter import circuit_breaker, retry_with_backoff, throttled
 
@@ -600,6 +601,124 @@ def get_rate_expectations() -> Dict[str, Any]:
 
 
 # ==========================================================================
+# FED NET LIQUIDITY
+# ==========================================================================
+# Multiplier to reach $ billions, keyed on the magnitude word FRED uses.
+# It writes units as "Mil. of U.S. $" or "Millions of U.S. Dollars", so match
+# the first three letters rather than enumerating every phrasing.
+_UNIT_TO_BILLIONS: Dict[str, float] = {
+    "bil": 1.0,
+    "mil": 1e-3,
+    "tri": 1e3,
+    "tho": 1e-6,
+}
+
+
+def _scale_to_billions(units: Optional[str]) -> Optional[float]:
+    """Multiplier taking a series in `units` to $bn, or None if unreadable."""
+    if not units:
+        return None
+    lowered = str(units).lower()
+    for token, factor in _UNIT_TO_BILLIONS.items():
+        if token in lowered:
+            return factor
+    return None
+
+
+@cached(ttl=config.TTL.macro, namespace="net_liquidity")
+def get_net_liquidity(years: int = 5) -> pd.DataFrame:
+    """
+    Fed net liquidity: balance sheet minus the TGA minus the reverse repo.
+
+    Total assets are only part of the story. Cash parked in the Treasury
+    General Account or the overnight reverse repo facility is drained out of
+    the financial system, so subtracting both gives the read that actually
+    tracks risk assets.
+
+    THE UNIT TRAP - the whole reason this function exists rather than being
+    three inline subtractions. FRED does not publish these on one scale:
+
+        WALCL      Mil. of U.S. $     ~6,676,000
+        WTREGEN    Mil. of U.S. $       ~800,500
+        RRPONTSYD  Bil. of US $              ~12
+
+    Subtract them raw and the repo leg comes off a thousand times too small.
+    Today that is a rounding error because the facility is nearly empty; in
+    2022-23 it held roughly $2,200bn, where the same bug overstates net
+    liquidity by $2.2 trillion. Nothing about the resulting chart looks wrong.
+
+    WHY THERE IS NO KEYLESS FALLBACK: units live in FRED's series metadata,
+    which needs an API key - the keyless CSV endpoint returns bare
+    observations. Inferring the scale from magnitude was considered and
+    rejected: RRPONTSYD currently reads ~12, which any magnitude heuristic
+    reads as trillions and scales up by 1000x. A wrong scale here is
+    invisible, so with no key this returns empty and says why rather than
+    publishing a number it cannot stand behind.
+
+    Returns:
+        DataFrame indexed daily with walcl_bn, tga_bn, rrp_bn and
+        net_liquidity_bn, plus `attrs["unit_source"]` mapping each leg to the
+        units it was scaled from and `attrs["reason"]` when empty.
+    """
+    start = (date.today() - timedelta(days=int(365.25 * years))).isoformat()
+
+    empty = pd.DataFrame()
+    if not config.FRED_API_KEY:
+        empty.attrs["reason"] = (
+            "Net liquidity needs a FRED API key. The three legs are published "
+            "on different scales (WALCL and WTREGEN in millions, RRPONTSYD in "
+            "billions) and only the keyed metadata endpoint reports units. "
+            "Free key at fredaccount.stlouisfed.org/apikeys."
+        )
+        return empty
+
+    legs: Dict[str, pd.Series] = {}
+    provenance: Dict[str, str] = {}
+
+    for column, series_id in config.NET_LIQUIDITY_SERIES.items():
+        try:
+            raw = get_fred_series(series_id, start=start)
+        except Exception as exc:
+            log.warning("Net liquidity leg %s failed: %s", series_id, exc)
+            raw = None
+
+        if raw is None or raw.empty:
+            provenance[column] = "unavailable"
+            continue
+
+        units = (get_fred_series_info(series_id) or {}).get("units")
+        factor = _scale_to_billions(units)
+        if factor is None:
+            provenance[column] = f"unreadable units ({units!r})"
+            continue
+
+        legs[column] = raw * factor
+        provenance[column] = str(units)
+
+    missing = [c for c in config.NET_LIQUIDITY_SERIES if c not in legs]
+    if missing:
+        empty.attrs["unit_source"] = provenance
+        empty.attrs["reason"] = (
+            "Could not place every leg on a common scale; missing or "
+            f"unreadable: {', '.join(missing)}. Net liquidity is not shown "
+            "rather than shown with a leg on the wrong scale."
+        )
+        return empty
+
+    # Weekly balance sheet, weekly TGA, daily repo - LOCF onto a daily grid so
+    # the subtraction uses the latest known value of each.
+    panel = macro_analytics.align_panel(legs, freq="D").ffill()
+    panel = panel.rename(columns={c: f"{c}_bn" for c in panel.columns})
+    panel = panel.dropna(subset=["walcl_bn", "tga_bn", "rrp_bn"])
+
+    panel["net_liquidity_bn"] = (
+        panel["walcl_bn"] - panel["tga_bn"] - panel["rrp_bn"]
+    )
+
+    panel.attrs["unit_source"] = provenance
+    return panel
+
+# ==========================================================================
 # WORLD BANK
 # ==========================================================================
 @cached(ttl=86400 * 7, namespace="worldbank")
@@ -751,7 +870,7 @@ def get_recession_indicators() -> Dict[str, Any]:
 __all__ = [
     "get_fred_series", "get_fred_series_info", "get_macro_series_group",
     "get_yield_curve", "get_yield_curve_history", "analyze_yield_curve",
-    "get_macro_dashboard", "get_rate_expectations",
+    "get_macro_dashboard", "get_rate_expectations", "get_net_liquidity",
     "get_world_bank_indicator", "get_recession_indicators",
     "FREDAPI_AVAILABLE",
 ]

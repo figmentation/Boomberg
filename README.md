@@ -22,11 +22,13 @@ runs — headlines just score `+0.00` across the board. See
 
 | Module | Command | Capability |
 |---|---|---|
+| **Fundamentals** | `AAPL FA` | Explainable BUY/HOLD/SELL verdict: business quality, financial health, earnings quality and multi-method intrinsic value, adapted per industry profile |
 | **Equity** | `AAPL EQUITY` | Candlesticks + EMA/RSI/MACD/Bollinger/ATR, as-reported financials from SEC XBRL, comparables from the issuer's own industry classification, options chains, per-ticker news |
-| **Macro** | `YCRV` | Full 11-tenor Treasury curve, inversion detection, composite recession score, FRED series browser, World Bank cross-country data |
+| **Macro** | `YCRV` `REGIME` | Growth/inflation regime matrix, full 11-tenor Treasury curve, inversion detection, composite recession score, Fed net liquidity, FRED series browser, World Bank cross-country data |
 | **Maritime** | `SUEZ SHIP` | AIS vessel positions, 7 chokepoint congestion monitors scored against locally measured baselines, MMSI/IMO lookup, custom area scans |
 | **Aviation** | `EUROPE FLY` | Live ADS-B state vectors, fleet tracking by ICAO operator designator, aircraft tracks, airport throughput |
-| **News** | `NEWS` | 21 RSS feeds + GDELT, sentiment scoring, trending-term extraction |
+| **Portfolio** | `PF` `ALLOC` | Mark-to-market holdings, position concentration, GICS sector exposure with ETF look-through, and rebalancing actions against a live benchmark |
+| **News** | `NEWS` `AAPL SOCIAL` | 21 RSS feeds + GDELT, sentiment scoring, trending-term extraction, and multi-platform sentiment fusion across headlines, StockTwits and Reddit |
 
 Command bar accepts Bloomberg-style syntax: `<SUBJECT> <FUNCTION>`. Type `HELP`
 for the full reference.
@@ -41,10 +43,12 @@ Everything here is free. The credentials are all optional.
 |---|---|---|
 | yfinance | No | Prices, fundamentals, options. Unofficial; 15-min delayed |
 | SEC EDGAR | No | Filings + XBRL company facts. Requires a descriptive User-Agent |
-| FRED | Optional | Keyless CSV endpoint is used automatically when no key is set |
+| FRED | Optional | Keyless CSV endpoint is used automatically when no key is set. Net liquidity is the one feature that needs a key — see below |
 | OpenSky | Optional | 400 credits/day anonymous, 4000 with free OAuth2 credentials |
 | AISStream | **Yes** (free) | The only module that genuinely needs a key to function |
 | GDELT | No | Global news index, 65+ languages |
+| StockTwits | No | Retail posts with explicit user Bull/Bear tags. Cloudflare-fronted |
+| Reddit | No | RSS only — the JSON API is 403 without OAuth. Rate-limits hard |
 | World Bank | No | Cross-country macro |
 
 Copy `.env.example` to `.env` and fill in whichever you want:
@@ -67,17 +71,25 @@ config.py               Credentials, TTLs, chokepoints, feeds, designators
 data_fetchers/
   equities.py           yfinance + SEC EDGAR XBRL + indicators
   macro.py              FRED (3-tier fallback) + World Bank + curve analysis
+  macro_regime.py       Growth/inflation panel, z-scores, regime matrix
+  fundamentals.py       Facts -> metrics -> axis scores -> verdict
+  valuation.py          DCF, multiples, peer/own history, bear/base/bull
   maritime.py           AIS: local SDR -> aisstream -> scrapers
   aviation.py           OpenSky OAuth2 + state vectors
   news.py               RSS + GDELT + VADER/FinBERT sentiment
+  social.py             StockTwits + Reddit -> fused sentiment score
+  portfolio.py          Holdings, mark-to-market, morning brief
+  allocation.py         GICS exposure, ETF look-through, rebalancing
 ui/
   terminal_theme.py     Bloomberg palette, CSS, Plotly template
-  components.py         Tape, tiles, charts, news feed, tables
+  components.py         Tape, tiles, charts, donuts, news feed, tables
   maps.py               Folium + Plotly dark geo rendering
 utils/
   cache.py              SQLite TTL cache + requests-cache sessions
   rate_limiter.py       Backoff, token buckets, circuit breakers
   observations.py       Append-only local series -> measured baselines
+  macro_analytics.py    Pure stats: alignment, z-scores, momentum
+  fundamental_math.py   Pure: CAGR, score anchors, DCF, margin of safety
 ```
 
 ### Nothing is asserted that can't be sourced
@@ -110,6 +122,237 @@ The pattern in each case: where a free authoritative source exists, use it;
 where one doesn't, measure it locally and show the sample count; where neither
 is possible, render nothing and say why. An empty panel is a finding.
 
+### The macro regime matrix
+
+`REGIME` reads the growth/inflation quadrant off the acceleration in both
+axes, not their levels. Each contributing series is turned into its 3-month
+annualised momentum, that momentum is z-scored against its own 3-year history,
+inverted where a rising reading means a weakening axis (jobless claims,
+financial conditions), and the axis score is the weighted mean. Weights and
+contributors live in `config.REGIME_INPUTS`; every one of them is shown
+alongside the verdict so the call can be argued with.
+
+Three things about it are worth knowing before you trust a reading:
+
+- **The historical strip is not a backtest.** FRED stamps an observation at
+  the start of the period it describes, but a July CPI print is not public
+  until mid-August and is revised for months after. The shaded bands are
+  today's revised data placed at the date it describes, so they will always
+  look more prescient than any real-time reading was.
+- **The call is unstable near the axes.** Over the last decade it flips
+  roughly every two months, because a quadrant read off two scores near zero
+  will change on noise. That is reported rather than smoothed away — the card
+  shows conviction and a flip count, and a LOW conviction reading means "no
+  clear regime", not a forecast. A persistence rule would produce a steadier
+  label and a less honest one.
+- **Every series declares its own units.** Unemployment moving 4.0 → 4.2 is
+  +0.2 percentage points; CPI moving 100 → 105 is +5 percent. Both format
+  identically in a table, and quoting the first as +5% describes a labour
+  market collapse that did not happen. `utils/macro_analytics` takes a
+  `transform` per series for exactly this reason, and the suite tests that
+  the two disagree.
+
+### Fed net liquidity needs a FRED key
+
+`WALCL − WTREGEN − RRPONTSYD` is the one calculation here that will not run
+keylessly, because FRED does not publish the three legs on one scale:
+
+| Series | Units | Recent |
+|---|---|---|
+| `WALCL` | **Millions** of USD | 6,676,249 |
+| `WTREGEN` | **Millions** of USD | 800,502 |
+| `RRPONTSYD` | **Billions** of USD | 11.7 |
+
+Subtract them raw and the repo facility comes off a thousand times too small.
+That is immaterial today with the facility nearly empty, and a $2.2 trillion
+overstatement at its 2022–23 peak — with a chart that looks entirely
+reasonable in both cases. Units live in FRED's metadata endpoint, which needs
+an API key; the keyless CSV path returns bare observations.
+
+Inferring the scale from magnitude was implemented and then removed:
+`RRPONTSYD` currently prints ~12, which any magnitude heuristic reads as
+trillions and scales up by 1000×. With no key the panel says so and shows
+nothing rather than publishing a number it cannot stand behind.
+
+### The fundamental verdict
+
+`FA` answers one question: given the filings and the current price, is this a
+BUY, HOLD or SELL? It is a mechanical screen, explainable end to end, and it
+is **not investment advice**.
+
+**Why it is a gate, not a score.** A low P/E must not by itself produce BUY and
+a high P/E must not by itself produce SELL — and one summed number cannot
+express "cheap but deteriorating", which is the case that costs money. So the
+verdict tests three axes in order (`config.VERDICT_RULES`): quality first, then
+value, then risk. A business scoring 40 for quality at a bargain price lands in
+SELL. One scoring 90 at a rich price lands in HOLD.
+
+**Why every score is explainable.** There is no fitted curve and no tuned
+constant. Each component is a raw value, a named anchor table and a linear
+interpolation — `score_band(0.19, [(0,0), (0.15,70), (0.25,90)])` is 78, and
+the breakdown table prints all three so the headline can be recomputed by hand.
+A metric that will not compute is skipped and the axis renormalises over what
+resolved; it is never scored zero, which would read as poor performance rather
+than absent data.
+
+**What it refuses to tell you.** Competitive moat, market share, management
+quality and industry outlook have no free data source. Moat and capital
+allocation are scored as *labelled proxies* from things that are filed — ROIC
+persistence, gross-margin stability, share count, buybacks, debt direction.
+Market share and industry outlook are reported as NOT AVAILABLE, excluded from
+every score, and they dock the confidence figure on every single run. A
+fabricated "wide moat" reads identically to a real one on screen.
+
+**Per-industry anchoring**, because running one DCF over everything is a
+category error, not conservatism:
+
+| Profile | Anchor | Not available at any price |
+|---|---|---|
+| General | Two-stage DCF on normalised FCF | — |
+| Bank / insurer | Justified P/B from ROE — a lender's FCF is a funding artefact | CET1, true NIM, NPL ratio |
+| REIT | P/AFFO, scored on FFO margin; GAAP depreciation makes net income uninformative | NAV, occupancy, same-store NOI |
+| Commodity | Mid-cycle margins — trailing earnings say where in the cycle the window fell | Per-unit production cost, reserve life |
+| High-growth tech | EV/sales and P/FCF; trailing P/E is negative or meaningless | Net revenue retention, RPO |
+
+**Confidence is itemised.** "62" is useless; "62, because the statements came
+from Yahoo rather than EDGAR and the valuation methods disagree by 90%" is
+actionable. Below `config.CONFIDENCE_FLOOR` the report shows INSUFFICIENT DATA
+instead of a verdict.
+
+### Two XBRL bugs this feature surfaced
+
+Both were pre-existing, both produced confident output, and both are now
+regression-tested:
+
+- **Fact unit selection.** `_facts_for_tag` chose the unit as `"USD" if "USD"
+  in units else next(iter(units))` — first key in dict order. Coca-Cola tags
+  `EarningsPerShareDiluted` under both `pure` (four stray 10-Q facts) and
+  `USD/shares` (fifty-one 10-K facts), so the fallback took `pure`, found no
+  annual facts, and returned nothing. KO's diluted EPS came back empty from a
+  filing that reports it on every page, and both P/E-based valuations silently
+  dropped out. The unit is now chosen by which one actually carries facts for
+  the requested form.
+- **A one-off year as the DCF base.** KO's FY2025 free cash flow was $5.3bn
+  against $9–11bn either side, entirely from one contingent-consideration
+  payment. Compounded for ten years that produced a fair value roughly half
+  what the business supports. The DCF now runs off the median FCF *margin*
+  applied to current revenue, which strips the one-off without dragging a
+  fast-growing company back to what it earned three years ago.
+
+### Multi-platform sentiment fusion
+
+`AAPL SOCIAL` fuses three crowds into one score on -1.00 to +1.00:
+Yahoo headlines (35%), StockTwits (35%) and Reddit (30%).
+
+**The disagreement is the point.** A fused number on its own buries the only
+genuinely interesting reading — when headlines are positive and the crowd is
+selling, or the reverse. That case is detected explicitly, reported in
+`signal_divergence`, and it pulls confidence down rather than being averaged
+into a comfortable middle. Opposite directions are flagged even when the gap
+is small, provided both readings clear a noise floor.
+
+**A silent platform is not a neutral one.** Weights renormalise over the
+platforms that actually answered. Zero-filling a dead StockTwits leg would
+drag a +0.60 reading to +0.39 and flip the band from EXTREMELY to MODERATELY
+BULLISH — a change caused by an outage, presented as a change in sentiment.
+When nothing resolves, the band is `NO SIGNAL`, not `NEUTRAL`.
+
+**Where users tag their own posts, believe them.** VADER scores
+*"$NVDA sell it bro. Best salesman of the century"* at **+0.79 bullish** —
+lexicons were not built for retail slang or sarcasm. About half of StockTwits
+posts carry a self-declared Bull/Bear tag, which is a statement of the
+author's actual position rather than a guess at their wording. Tags carry 70%
+of the retail score and set the direction of any post that has one. The panel
+also reports how often the two disagreed, which is the honest measure of how
+much the lexicon can be trusted on that stream.
+
+**Drivers are filtered to items naming the ticker.** Yahoo's per-ticker feed
+carries sector pieces about other companies and StockTwits users cash-tag
+five symbols per post. Unfiltered, the top "bullish NVDA driver" was a
+headline about Progress Software — worse than no driver, because it looks
+like evidence. Below four matches the unfiltered set is shown with a caption
+saying so.
+
+**Confidence is coverage x volume x agreement**, each itemised. A large but
+contradictory sample does not read as confident.
+
+#### Endpoint notes
+
+Two things worth knowing before changing the fetchers:
+
+- **StockTwits rejects `PLAIN_USER_AGENT`.** It sits behind Cloudflare and
+  serves a challenge page to the plain client string; it needs a descriptive
+  or browser UA. This is the exact opposite of FRED's `fredgraph.csv`, which
+  accepts the connection and then never replies when sent a browser UA. Both
+  requirements are load-bearing and they contradict each other — do not
+  "harmonise" them.
+- **Reddit's JSON API is gone without OAuth** (403 on everything). The `.rss`
+  endpoints still answer with a browser UA but rate-limit hard: three quick
+  probes during development earned a 429. It gets the slowest token bucket in
+  the codebase, one retry instead of five, and a circuit breaker that opens
+  after two failures — firing fifteen requests at an endpoint that just said
+  "too many requests" makes the problem worse, not better.
+
+### Sector allocation and rebalancing
+
+`ALLOC` maps holdings to the eleven GICS sectors, compares them to a
+benchmark, and converts the gap to dollars. Two things it will not guess:
+
+**A fund is not a sector.** VOO is not "a technology position" and it is not
+unclassifiable either — it is 37% technology, 12% financials and nine other
+things. Fund holdings are looked through to their published sector weights
+and distributed accordingly. This is not a marginal correction: the test
+portfolio is 55% VOO, so filing it under its largest sector would have shown
+technology at 55%+ when the truth is nearer 30%, and dropping it showed the
+book as 55% unknown.
+
+**Benchmark targets are read, never typed.** Each benchmark names a real fund
+— S&P 500 via SPY, Tech Growth via QQQ, Income/Defensive via SCHD, Value via
+VTV — and its *current* published sector weights define the target. Index
+weights move constantly (technology has gone from about a quarter of the S&P
+500 to over a third in a few years), so a hardcoded table is wrong the day
+after it is written and keeps rendering a confident drift column while it
+rots.
+
+Anything that cannot be placed is reported as UNCLASSIFIED with its dollar
+value and **excluded from the drift arithmetic**. Leaving it in the
+denominator understates every sector by the same amount, so the whole book
+reads underweight and eleven spurious ADD actions appear. Drift below 2pp
+produces no action at all — it costs more in spread and tax to fix than it
+represents, and a list of eleven trivial actions buries the two that matter.
+
+#### The position weight panel
+
+Reworked from a bare bar chart at a fixed 280px. Three usability problems,
+none of them correctness:
+
+- **Fixed height.** Six positions got fat bars and dead space; twenty got
+  unreadable slivers. Height now scales with the row count, floored and
+  capped.
+- **Percent only.** "VOO 54.9%" is the less useful half of the answer when
+  you want to know what that is in money. Bars now carry both.
+- **No concentration read.** A weight list does not tell you that six
+  positions behave like fewer than three. The effective position count
+  (1/HHI) does — a twenty-name book where one holding is 60% has an effective
+  count near three, and that is the number that describes the risk.
+
+It also says out loud when unpriced positions are missing from the picture.
+They were being dropped silently, so a book with a dead symbol showed weights
+summing to 100% of something smaller than the book.
+
+Bars sit beside a donut on both the holdings and allocation views, because
+they answer different questions: bars rank and compare precisely, a donut
+shows share of the whole and puts the total in the hole — the one number a
+pie otherwise throws away. Slice order is pinned to the table order
+(Plotly re-sorts pies by default, which quietly breaks that
+correspondence), and past twelve slices the smallest are pooled into OTHER
+with its real total kept.
+
+The shared Plotly colorway went from eight entries to twelve for this.
+There are eleven GICS sectors, and Plotly cycles the list — so eight
+colours put two slices in the same shade, which reads as one category
+split in two.
+
 ### Resilience
 
 Free data sources fail constantly. Three layers handle it:
@@ -130,7 +373,7 @@ Free data sources fail constantly. Three layers handle it:
 ## Tests
 
 ```bash
-pytest                # 203 offline tests, ~3s
+pytest                # 446 offline tests, ~8s
 pytest -m network     # 6 live tests against SEC EDGAR
 pytest -m "" -q       # everything
 ```
@@ -144,7 +387,11 @@ outage trains you to ignore failures.
 | `test_indicators.py` | RSI/ATR against a textbook Wilder loop, EMA/MACD/Bollinger identities, empty and short-frame edges |
 | `test_xbrl.py` | SEC period labelling, duration/form filtering, restatements, live accounting identities |
 | `test_resilience.py` | Circuit breaker states and fail-fast timing, retry/backoff, token bucket, cache TTL and stale-on-error, measured congestion baselines |
-| `test_domain.py` | Command parser, ticker normalisation, AIS sentinels and MMSI flags, yield-curve analysis, sentiment, derived peer selection |
+| `test_domain.py` | Command parser, ticker normalisation, AIS sentinels and MMSI flags, yield-curve analysis, sentiment, derived peer selection, chart title serialisation |
+| `test_fundamentals.py` | Score anchors and renormalisation, DCF guards, the two verdict constraints, XBRL unit selection, SEC/Yahoo row aliases, normalised FCF base, provenance |
+| `test_social.py` | Sentiment bands, weight renormalisation over silent platforms, confidence from coverage/volume/agreement, divergence detection, tag-vs-lexicon direction, driver ticker filtering |
+| `test_allocation.py` | GICS crosswalk both Yahoo spellings, ETF look-through vs single-sector filing, unclassified excluded from the drift denominator, action thresholds and OPEN-vs-ADD, effective position count |
+| `test_macro_regime.py` | Frequency alignment and LOCF direction, z-scores, the percent-vs-percentage-point transform trap, ragged-edge truncation, quadrant mapping and sign conventions, FRED unit scaling |
 
 The two indicator/XBRL files are **regression suites, not coverage padding**.
 Both bugs they guard were invisible in the UI — the chart drew a plausible

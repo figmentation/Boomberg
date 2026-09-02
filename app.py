@@ -17,6 +17,7 @@ or an empty state, never a traceback in the user's face.
 
 from __future__ import annotations
 
+import html
 import logging
 import sys
 import traceback
@@ -41,6 +42,9 @@ st.set_page_config(
 
 from data_fetchers import aviation, equities, macro, maritime, news  # noqa: E402
 from data_fetchers import company_intel, portfolio, supply_chain  # noqa: E402
+from data_fetchers import macro_regime  # noqa: E402
+from data_fetchers import fundamentals, social  # noqa: E402
+from data_fetchers import allocation  # noqa: E402
 from ui import components as ui  # noqa: E402
 from ui import maps  # noqa: E402
 from ui.terminal_theme import THEME, apply_theme  # noqa: E402
@@ -193,8 +197,9 @@ def execute_command(raw: str) -> None:
         return
 
     module = parsed["module"]
-    if module in ("equity", "supply_chain"):
-        # Both modules key off the same ticker, so "NVDA SPLC" sets it too.
+    if module in ("equity", "supply_chain", "fundamentals"):
+        # These modules key off the same ticker, so "NVDA SPLC" and "NVDA FA"
+        # both set it and switching pages keeps the name you were looking at.
         st.session_state["ticker"] = equities.normalize_ticker(subject)
     elif module == "maritime":
         if subject in config.CHOKEPOINTS:
@@ -205,6 +210,13 @@ def execute_command(raw: str) -> None:
     elif module == "aviation":
         if subject in config.AVIATION_REGIONS:
             st.session_state["aviation_region"] = subject
+    elif module == "news":
+        # "NVDA SOCIAL" should land on the social tab already looking at NVDA.
+        # Anything that normalises to a plausible symbol sets the shared
+        # ticker; a category word like ENERGY does not.
+        symbol = equities.normalize_ticker(subject).upper()
+        if symbol and symbol.isalpha() and len(symbol) <= 5:
+            st.session_state["ticker"] = symbol
     elif module == "portfolio":
         # "NVDA WATCH" adds a symbol without a trip to the editor. The add is
         # idempotent and the row is deletable, so a typo costs one click.
@@ -279,7 +291,8 @@ def render_command_bar() -> None:
     shortcuts = [
         ("HOME", "home"), ("EQUITY", "equity"), ("SPLC", "supply_chain"),
         ("SHIP", "maritime"), ("FLY", "aviation"), ("MACRO", "macro"),
-        ("NEWS", "news"), ("PF", "portfolio"), ("HELP", "help"),
+        ("FA", "fundamentals"), ("NEWS", "news"), ("PF", "portfolio"),
+        ("HELP", "help"),
     ]
     cols = st.columns(len(shortcuts))
     for col, (label, module) in zip(cols, shortcuts):
@@ -436,6 +449,28 @@ def _home_quotes(symbols: Tuple[str, ...]) -> Dict[str, Dict[str, Any]]:
 
 def page_home() -> None:
     ui.module_header("OPEN-TERMINAL", "MARKET OVERVIEW")
+
+    # Macro regime banner. Wrapped in _safe and tolerant of an empty verdict:
+    # a FRED outage must not take the landing page with it.
+    verdict = _safe(macro_regime.classify, default={})
+    if verdict and verdict.get("regime"):
+        accent = _regime_accent(verdict)
+        stamp = verdict.get("as_of")
+        st.markdown(
+            f'<div style="border-left:3px solid {accent};'
+            f'background:{THEME.bg_panel};padding:6px 13px;margin-bottom:10px;'
+            f'font-size:11px;">'
+            f'<span style="color:{THEME.muted};">MACRO REGIME</span>&nbsp;&nbsp;'
+            f'<span style="color:{accent};letter-spacing:0.08em;">'
+            f'{verdict["regime"]}</span>'
+            f'<span style="color:{THEME.muted};"> — {verdict["posture"]} · '
+            f'growth {verdict["growth_z"]:+.2f} · '
+            f'inflation {verdict["inflation_z"]:+.2f} · '
+            f'{verdict["conviction"]} conviction · '
+            f'{pd.Timestamp(stamp).strftime("%b %Y") if stamp is not None else ""}'
+            f'</span></div>',
+            unsafe_allow_html=True,
+        )
 
     # --- Index tiles -------------------------------------------------------
     st.markdown("### MAJOR INDICES")
@@ -1726,11 +1761,15 @@ def page_macro() -> None:
             "fredaccount.stlouisfed.org/apikeys."
         )
 
-    tabs = st.tabs(["YIELD CURVE", "RECESSION SIGNALS", "INFLATION",
+    tabs = st.tabs(["REGIME", "YIELD CURVE", "RECESSION SIGNALS", "INFLATION",
                     "LABOR & GROWTH", "LIQUIDITY", "GLOBAL"])
 
-    # ---- YIELD CURVE -----------------------------------------------------
+    # ---- REGIME ----------------------------------------------------------
     with tabs[0]:
+        _render_regime_tab()
+
+    # ---- YIELD CURVE -----------------------------------------------------
+    with tabs[1]:
         curve = _safe(macro.get_yield_curve, default=pd.DataFrame())
 
         if curve.empty:
@@ -1812,7 +1851,7 @@ def page_macro() -> None:
                 )
 
     # ---- RECESSION -------------------------------------------------------
-    with tabs[1]:
+    with tabs[2]:
         indicators = _safe(macro.get_recession_indicators, default={})
 
         if not indicators or not indicators.get("signals"):
@@ -1860,8 +1899,8 @@ def page_macro() -> None:
             )
 
     # ---- SERIES BROWSERS -------------------------------------------------
-    for tab, group in ((tabs[2], "INFLATION"), (tabs[3], "LABOR"),
-                       (tabs[4], "LIQUIDITY")):
+    for tab, group in ((tabs[3], "INFLATION"), (tabs[4], "LABOR"),
+                       (tabs[5], "LIQUIDITY")):
         with tab:
             _render_series_group(group)
             if group == "LABOR":
@@ -1869,7 +1908,7 @@ def page_macro() -> None:
                 _render_series_group("GROWTH")
 
     # ---- GLOBAL ----------------------------------------------------------
-    with tabs[5]:
+    with tabs[6]:
         indicator = st.selectbox(
             "WORLD BANK INDICATOR",
             list(config.WORLD_BANK_INDICATORS),
@@ -1898,6 +1937,289 @@ def page_macro() -> None:
                 data.pivot(index="year", columns="country", values="value")
                 .sort_index(ascending=False).head(20)
             )
+
+
+def _regime_accent(verdict: Dict[str, Any]) -> str:
+    """Theme colour for a regime verdict, or muted when there is no call."""
+    return getattr(THEME, verdict.get("colour") or "", THEME.muted)
+
+
+def _regime_quadrant_figure(verdict: Dict[str, Any], height: int = 360):
+    """
+    Where the two axis scores put us on the growth/inflation matrix.
+
+    `ui.gauge` is semicircular and reads one number; this reads two, so it is
+    a small scatter rather than a new reusable component. Styling goes through
+    the shared `style_figure`, so it inherits the terminal palette and needs
+    no CSS of its own.
+    """
+    import plotly.graph_objects as go
+    from ui.terminal_theme import style_figure
+
+    bound = 2.5
+    fig = go.Figure()
+
+    # Quadrant backgrounds, in the same order as config.REGIME_QUADRANTS.
+    corners = [
+        ((0, bound), (-bound, 0), "GOLDILOCKS", THEME.green),
+        ((0, bound), (0, bound), "OVERHEATING", THEME.amber),
+        ((-bound, 0), (0, bound), "STAGFLATION", THEME.red),
+        ((-bound, 0), (-bound, 0), "DEFLATIONARY\nBUST", THEME.cyan),
+    ]
+    for (x0, x1), (y0, y1), label, colour in corners:
+        fig.add_shape(type="rect", x0=x0, x1=x1, y0=y0, y1=y1,
+                      line=dict(width=0),
+                      fillcolor=f"rgba({ui._hex_to_rgb(colour)},0.07)",
+                      layer="below")
+        fig.add_annotation(
+            x=(x0 + x1) / 2, y=(y0 + y1) / 2, text=label.replace("\n", "<br>"),
+            showarrow=False,
+            font=dict(size=9, color=colour, family=THEME.font_mono),
+            opacity=0.75,
+        )
+
+    for axis in ("x", "y"):
+        fig.add_shape(
+            type="line", layer="below",
+            x0=-bound if axis == "x" else 0, x1=bound if axis == "x" else 0,
+            y0=0 if axis == "x" else -bound, y1=0 if axis == "x" else bound,
+            line=dict(color=THEME.border, width=1),
+        )
+
+    growth = verdict.get("growth_z")
+    inflation = verdict.get("inflation_z")
+    if growth is not None and inflation is not None:
+        accent = _regime_accent(verdict)
+        fig.add_trace(go.Scatter(
+            x=[growth], y=[inflation], mode="markers+text",
+            marker=dict(size=17, color=accent, symbol="circle",
+                        line=dict(color=THEME.bg, width=2)),
+            text=[verdict.get("regime", "")], textposition="top center",
+            textfont=dict(size=10, color=accent, family=THEME.font_mono),
+            hovertemplate=(f"Growth {growth:+.2f}<br>"
+                           f"Inflation {inflation:+.2f}<extra></extra>"),
+            showlegend=False,
+        ))
+
+    fig.update_xaxes(title_text="GROWTH MOMENTUM (z)", range=[-bound, bound],
+                     zeroline=False)
+    fig.update_yaxes(title_text="INFLATION MOMENTUM (z)", range=[-bound, bound],
+                     zeroline=False)
+    return style_figure(fig, height=height, title="REGIME MATRIX",
+                        showlegend=False)
+
+
+def _regime_overlay_figure(indicator: pd.Series, indicator_label: str,
+                           benchmark: pd.Series, history: pd.Series,
+                           height: int = 420):
+    """
+    One indicator against the S&P 500, both rebased to 100, regimes shaded.
+
+    `ui.line_chart` has no secondary y-axis, and rather than add one both
+    series are standardised to mean 0 / sd 1. Rebasing to 100 was the first
+    attempt and is wrong for half these series: CFNAI and NFCI oscillate
+    about zero, so dividing by a first value of -0.08 inverts the line and
+    multiplies it by a thousand - the chart came out spanning -5,000 to
+    20,000. Standardising needs no meaningful zero, and unlike a secondary
+    axis it cannot be slid until two lines appear to agree.
+
+    The regime bands are added afterwards with `add_vrect`, the same
+    post-processing the yield-curve tab already does with `add_hline`.
+    """
+    from utils import macro_analytics as ma
+
+    series_map = {}
+    scaled_indicator = ma.standardize(indicator)
+    if not scaled_indicator.empty:
+        series_map[indicator_label] = scaled_indicator
+    scaled_benchmark = ma.standardize(benchmark)
+    if not scaled_benchmark.empty:
+        series_map["S&P 500"] = scaled_benchmark
+
+    fig = ui.line_chart(series_map, f"{indicator_label} vs S&P 500",
+                        "STANDARDISED (z)", height=height)
+
+    if history is not None and not history.empty:
+        for start, end, label in ma.runs(history):
+            colour = getattr(
+                THEME,
+                dict((v[0], v[2]) for v in config.REGIME_QUADRANTS.values())
+                .get(label, ""),
+                THEME.muted,
+            )
+            fig.add_vrect(
+                x0=start, x1=end, layer="below", line_width=0,
+                fillcolor=f"rgba({ui._hex_to_rgb(colour)},0.10)",
+            )
+
+    return fig
+
+
+def _render_regime_tab() -> None:
+    """
+    The macro regime card, metric table and overlay.
+
+    Every element here is an existing component from `ui/components.py`; the
+    only bespoke figure is the two-axis quadrant scatter, which has no
+    equivalent among them.
+    """
+    verdict = _safe(macro_regime.classify, default={})
+
+    if not verdict or not verdict.get("regime"):
+        ui.alert(
+            verdict.get("reason", "Regime classification unavailable."), "warn")
+        st.caption(
+            "The quadrant is only reported when both axes clear "
+            f"{config.REGIME_MIN_CONTRIBUTORS} resolved contributors. Fewer "
+            "than that and the call would describe which FRED fetches "
+            "succeeded, not the economy."
+        )
+        return
+
+    accent = _regime_accent(verdict)
+    as_of = verdict.get("as_of")
+    as_of_label = (pd.Timestamp(as_of).strftime("%b %Y")
+                   if as_of is not None else "—")
+
+    # --- Headline card ----------------------------------------------------
+    curve = _safe(macro.get_yield_curve, default=pd.DataFrame())
+    spreads = (macro.analyze_yield_curve(curve).get("spreads", {})
+               if not curve.empty else {})
+    liquidity = _safe(macro.get_net_liquidity, 2, default=pd.DataFrame())
+
+    ui.metric_row([
+        ui.metric_tile("REGIME", verdict["regime"], subtitle=as_of_label,
+                       accent=accent),
+        ui.metric_tile("GROWTH", verdict["growth_z"],
+                       subtitle=f"z · {verdict['growth_n']} inputs",
+                       value_format="{:+.2f}",
+                       accent=THEME.green if verdict["growth_z"] > 0 else THEME.red),
+        ui.metric_tile("INFLATION", verdict["inflation_z"],
+                       subtitle=f"z · {verdict['inflation_n']} inputs",
+                       value_format="{:+.2f}",
+                       accent=THEME.red if verdict["inflation_z"] > 0 else THEME.green),
+        ui.metric_tile("CONVICTION", verdict["conviction"],
+                       subtitle=f"{verdict['run_months']}m in regime · "
+                                f"{verdict.get('flips_12m', 0)} flips/12m",
+                       accent={"HIGH": THEME.green, "MODERATE": THEME.amber}
+                       .get(verdict["conviction"], THEME.muted)),
+        ui.metric_tile("10Y-2Y", (spreads.get("10Y-2Y") or 0) * 100,
+                       subtitle="basis points", value_format="{:+,.0f}",
+                       accent=THEME.red if (spreads.get("10Y-2Y") or 0) < 0
+                       else THEME.green),
+        ui.metric_tile(
+            "NET LIQUIDITY",
+            float(liquidity["net_liquidity_bn"].iloc[-1])
+            if not liquidity.empty else None,
+            subtitle="$bn · WALCL − TGA − RRP", value_format="{:,.0f}"),
+    ], columns=6)
+
+    st.markdown(
+        f'<div style="border-left:3px solid {accent};background:{THEME.bg_panel};'
+        f'padding:8px 14px;margin:6px 0 12px 0;">'
+        f'<span style="color:{accent};font-size:13px;letter-spacing:0.1em;">'
+        f'{verdict["regime"]}</span>'
+        f'<span style="color:{THEME.muted};font-size:11px;"> — '
+        f'{verdict["posture"]}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    if liquidity.empty and liquidity.attrs.get("reason"):
+        ui.alert(liquidity.attrs["reason"], "warn")
+
+    # --- Matrix + contributors -------------------------------------------
+    matrix_col, detail_col = st.columns([2, 3])
+
+    with matrix_col:
+        ui.render_chart(_regime_quadrant_figure(verdict))
+
+    with detail_col:
+        st.markdown("#### AXIS CONTRIBUTORS")
+        contributors = pd.DataFrame(verdict.get("contributors", []))
+        if not contributors.empty:
+            display = contributors.rename(columns={
+                "label": "Contributor", "axis": "Axis", "z": "Momentum z",
+                "weight": "Weight", "note": "Note",
+            })
+            ui.styled_table(
+                display[["Contributor", "Axis", "Momentum z", "Weight", "Note"]],
+                highlight_columns=["Momentum z"], height=250,
+            )
+        st.caption(
+            "Each contributor is its 3-month annualised momentum, z-scored "
+            "against its own 3-year history and sign-corrected so a higher "
+            "score always means a stronger axis. The axis score is their "
+            "weighted mean; weights live in config.REGIME_INPUTS."
+        )
+        if verdict.get("flips_12m", 0) >= 4:
+            st.caption(
+                f"This call has changed {verdict['flips_12m']} times in the "
+                "last 12 months. Momentum classification is genuinely "
+                "unstable when both scores sit near zero — treat a LOW "
+                "conviction reading as 'no clear regime', not as a forecast."
+            )
+
+    # --- Metric table -----------------------------------------------------
+    st.markdown("#### MACRO METRICS")
+    metrics = _safe(macro_regime.metric_table, default=pd.DataFrame())
+    if metrics.empty:
+        ui.alert("No macro metrics resolved.", "warn")
+    else:
+        ui.styled_table(
+            metrics[["Metric", "Series", "Level", "1M Chg", "YoY", "3M Mom",
+                     "Z (1Y)", "Z (3Y)", "Signal", "As Of"]],
+            highlight_columns=["1M Chg", "YoY", "3M Mom", "Z (1Y)", "Z (3Y)"],
+        )
+        st.caption(
+            "Change columns follow each series' own units: percentage series "
+            "(unemployment, spreads, NFCI) move in percentage POINTS, index "
+            "series (CPI, payrolls, PPI) in percent. As Of is that series' "
+            "last real print — they differ, because macro data has a ragged "
+            "edge and nothing here is forward-filled into a change column."
+        )
+
+    # --- Overlay ----------------------------------------------------------
+    st.markdown("#### INDICATOR VS S&P 500")
+    panel = _safe(macro_regime.build_panel, default=pd.DataFrame())
+    if panel.empty:
+        return
+
+    choices = [s.series_id for s in macro_regime._all_specs()
+               if s.series_id in panel.columns]
+    labels = {s.series_id: s.label for s in macro_regime._all_specs()}
+
+    chosen = st.selectbox(
+        "INDICATOR", choices, key="regime_overlay",
+        format_func=lambda sid: f"{sid} — {labels.get(sid, sid)}",
+    )
+
+    benchmark = _safe(equities.get_history, "^GSPC", "10y", "1mo",
+                      default=pd.DataFrame())
+    benchmark_close = (benchmark["Close"] if not benchmark.empty
+                       and "Close" in benchmark.columns else pd.Series(dtype=float))
+    if not benchmark_close.empty:
+        benchmark_close.index = pd.to_datetime(
+            benchmark_close.index).tz_localize(None)
+
+    indicator = panel[chosen].dropna()
+    if not indicator.empty and not benchmark_close.empty:
+        start = max(indicator.index.min(), benchmark_close.index.min())
+        indicator = indicator[indicator.index >= start]
+        benchmark_close = benchmark_close[benchmark_close.index >= start]
+
+    history = _safe(macro_regime.regime_history, panel, default=pd.Series(dtype=object))
+    ui.render_chart(_regime_overlay_figure(
+        indicator, labels.get(chosen, chosen), benchmark_close, history))
+
+    st.caption(
+        "Shaded bands are the classified regime for each month. They are "
+        "built from today's revised data placed at the date it describes — "
+        "FRED stamps an observation at the start of its period, but a July "
+        "CPI print is not public until mid-August and is revised for months "
+        "after. This strip therefore looks more prescient than any real-time "
+        "reading was, and is a description of history, not a backtest. "
+        "Neither it nor the regime call is investment advice."
+    )
 
 
 def _render_series_group(group: str) -> None:
@@ -1985,6 +2307,311 @@ def _yield_curve_figure(curve: pd.DataFrame, analysis: Dict[str, Any],
     return style_figure(fig, height=height, title=title, showlegend=False)
 
 
+
+# ==========================================================================
+# PAGE: FUNDAMENTAL ANALYSIS
+# ==========================================================================
+def _fa_accent(verdict: str) -> str:
+    return getattr(THEME, config.VERDICT_COLOURS.get(verdict, "muted"), THEME.muted)
+
+
+def _fa_component_rows(report: Dict[str, Any]) -> pd.DataFrame:
+    """
+    Every scored component as a row, including the ones that did not resolve.
+
+    This table is the answer to "why 86?". Each row carries the raw value,
+    the anchor table that turned it into points, the weight it was given and
+    where the number came from - so the headline score can be recomputed by
+    hand from what is on screen.
+    """
+    rows: List[Dict[str, Any]] = []
+    for axis_name, axis in report.get("axes", {}).items():
+        for component in axis.get("components", []):
+            rows.append({
+                "Axis": axis_name.replace("_", " ").title(),
+                "Component": component.name,
+                "Value": fundamentals.format_metric(component.value,
+                                                    component.unit),
+                "Points": component.points,
+                "Weight": component.weight,
+                "Source": component.source,
+                "Anchors": component.anchor_label(),
+                "Note": (component.note or "")[:90],
+            })
+    return pd.DataFrame(rows)
+
+
+def page_fundamentals() -> None:
+    ui.module_header("FUNDAMENTAL ANALYSIS",
+                     "BUSINESS QUALITY · FINANCIAL HEALTH · VALUATION · VERDICT")
+
+    ticker = st.session_state.get("ticker", config.DEFAULT_TICKER)
+
+    control, override_col = st.columns([1, 3])
+    with control:
+        entered = st.text_input("TICKER", value=ticker, key="fa_ticker")
+        entered = equities.normalize_ticker(entered).upper()
+        if entered and entered != ticker:
+            st.session_state["ticker"] = entered
+        ticker = entered or ticker
+
+    with override_col:
+        with st.expander("DCF ASSUMPTIONS — override the derived defaults"):
+            st.caption(
+                "These are FORECAST ASSUMPTIONS, not facts. Defaults come "
+                "from the company's own history and the live 10-year "
+                "Treasury yield. Change them and the fair value changes — "
+                "that sensitivity is the point."
+            )
+            a, b, c = st.columns(3)
+            with a:
+                growth_override = st.number_input(
+                    "GROWTH (%)", value=0.0, step=0.5, format="%.1f",
+                    key="fa_growth",
+                    help="0 keeps the derived default.")
+            with b:
+                discount_override = st.number_input(
+                    "DISCOUNT RATE (%)", value=0.0, step=0.5, format="%.1f",
+                    key="fa_discount", help="0 keeps the CAPM-derived rate.")
+            with c:
+                terminal_override = st.number_input(
+                    "TERMINAL GROWTH (%)", value=0.0, step=0.1, format="%.1f",
+                    key="fa_terminal", help="0 keeps the configured default.")
+
+    overrides: Dict[str, float] = {}
+    if growth_override:
+        overrides["growth"] = growth_override / 100.0
+    if discount_override:
+        overrides["discount_rate"] = discount_override / 100.0
+    if terminal_override:
+        overrides["terminal_growth"] = terminal_override / 100.0
+
+    if not ticker:
+        ui.alert("Enter a ticker to run the analysis.", "warn")
+        return
+
+    with st.spinner(f"Reading {ticker} filings and building the valuation…"):
+        report = _safe(fundamentals.assess, ticker,
+                       overrides or None, default={})
+
+    if not report:
+        ui.alert(f"Fundamental analysis unavailable for {ticker}.", "error")
+        return
+
+    if report.get("verdict") == "INSUFFICIENT DATA" and "reason" in report:
+        ui.alert(report["reason"], "warn")
+        return
+
+    verdict = report["verdict"]
+    accent = _fa_accent(verdict)
+    profile = report["profile"]
+    scores = report["scores"]
+    valuation = report["valuation"]
+
+    # --- Verdict banner ---------------------------------------------------
+    st.markdown(
+        f'<div style="border-left:4px solid {accent};background:{THEME.bg_panel};'
+        f'padding:12px 16px;margin:4px 0 12px 0;">'
+        f'<div style="color:{THEME.muted};font-size:10px;letter-spacing:0.14em;">'
+        f'FUNDAMENTAL VERDICT · {report["name"]} · {profile.label} · '
+        f'{report["statement_source"]} {report["as_of"]}</div>'
+        f'<div style="color:{accent};font-size:26px;font-weight:700;'
+        f'letter-spacing:0.08em;">{verdict}</div>'
+        f'<div style="color:{THEME.muted};font-size:11px;">'
+        f'{report["verdict_detail"]["rule"]}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    # --- Scores -----------------------------------------------------------
+    ui.metric_row([
+        ui.metric_tile("OVERALL", report.get("overall_score"), subtitle="/100",
+                       value_format="{:.0f}", accent=accent),
+        ui.metric_tile("BUSINESS QUALITY", scores.get("business_quality"),
+                       subtitle="/100", value_format="{:.0f}"),
+        ui.metric_tile("GROWTH", scores.get("growth"), subtitle="/100",
+                       value_format="{:.0f}"),
+        ui.metric_tile("FINANCIAL HEALTH", scores.get("financial_health"),
+                       subtitle="/100", value_format="{:.0f}"),
+        ui.metric_tile("VALUATION", scores.get("valuation"),
+                       subtitle="/100 · higher = cheaper", value_format="{:.0f}"),
+        ui.metric_tile("RISK", scores.get("risk"),
+                       subtitle="/100 · higher = worse", value_format="{:.0f}",
+                       accent=THEME.red if (scores.get("risk") or 0) > 55
+                       else THEME.green),
+    ], columns=6)
+
+    # --- Intrinsic value --------------------------------------------------
+    st.markdown("### INTRINSIC VALUE")
+    ui.metric_row([
+        ui.metric_tile("BEAR", valuation.get("bear"), value_format="{:,.2f}",
+                       accent=THEME.red),
+        ui.metric_tile("BASE", valuation.get("base"), value_format="{:,.2f}",
+                       accent=THEME.amber),
+        ui.metric_tile("BULL", valuation.get("bull"), value_format="{:,.2f}",
+                       accent=THEME.green),
+        ui.metric_tile("CURRENT PRICE", report.get("price"),
+                       value_format="{:,.2f}", accent=THEME.cyan),
+        ui.metric_tile("UPSIDE TO BASE",
+                       (valuation.get("upside_to_base") or 0) * 100
+                       if valuation.get("upside_to_base") is not None else None,
+                       subtitle="%", value_format="{:+.1f}",
+                       accent=THEME.green if (valuation.get("upside_to_base") or 0) > 0
+                       else THEME.red),
+        ui.metric_tile("MARGIN OF SAFETY",
+                       (valuation.get("margin_of_safety") or 0) * 100
+                       if valuation.get("margin_of_safety") is not None else None,
+                       subtitle="%", value_format="{:+.1f}",
+                       accent=THEME.green if (valuation.get("margin_of_safety") or 0) > 0
+                       else THEME.red),
+    ], columns=6)
+
+    dispersion = valuation.get("dispersion")
+    if dispersion is not None and dispersion > 0.5:
+        ui.alert(
+            f"Valuation methods disagree by {dispersion:.0%} of the median. "
+            "The fair value is a range, not a figure — read the method table "
+            "below rather than the base case alone.", "warn")
+
+    # --- Narrative --------------------------------------------------------
+    left, right = st.columns(2)
+    with left:
+        st.markdown("#### WHY")
+        for reason in report["reasons"]["strengths"] or ["No component scored above 60."]:
+            st.markdown(
+                f'<div style="border-left:2px solid {THEME.green};'
+                f'padding:4px 10px;margin:4px 0;font-size:11px;'
+                f'color:{THEME.cyan};">{reason}</div>', unsafe_allow_html=True)
+    with right:
+        st.markdown("#### KEY RISKS")
+        for risk in report["reasons"]["weaknesses"] or ["No component scored below 45."]:
+            st.markdown(
+                f'<div style="border-left:2px solid {THEME.red};'
+                f'padding:4px 10px;margin:4px 0;font-size:11px;'
+                f'color:{THEME.cyan};">{risk}</div>', unsafe_allow_html=True)
+
+    st.markdown("#### VALUATION")
+    st.caption(report["narrative"]["valuation"])
+    st.markdown("#### THESIS")
+    st.caption(report["narrative"]["thesis"])
+
+    trigger_buy, trigger_sell = st.columns(2)
+    with trigger_buy:
+        st.markdown("#### BUY TRIGGERS")
+        for item in report["triggers"]["buy"] or ["None identified."]:
+            st.caption(f"• {item}")
+    with trigger_sell:
+        st.markdown("#### SELL TRIGGERS")
+        for item in report["triggers"]["sell"] or ["None identified."]:
+            st.caption(f"• {item}")
+
+    # --- Detail tabs ------------------------------------------------------
+    detail = st.tabs(["SCORE BREAKDOWN", "VALUATION METHODS", "METRICS",
+                      "EARNINGS QUALITY", "ASSUMPTIONS", "CONFIDENCE"])
+
+    with detail[0]:
+        st.caption(
+            "Every component that fed a score. Points come from interpolating "
+            "the raw value across the anchor table shown — no fitted curves "
+            "and no hidden constants, so the headline score can be "
+            "recomputed by hand from this table."
+        )
+        breakdown = _fa_component_rows(report)
+        if breakdown.empty:
+            ui.alert("No components scored.", "warn")
+        else:
+            ui.styled_table(breakdown, numeric_format="{:,.3f}")
+
+    with detail[1]:
+        methods = pd.DataFrame(valuation.get("methods", []))
+        if not methods.empty:
+            methods = methods.rename(columns={
+                "method": "Method", "per_share": "Value / share",
+                "basis": "Basis", "note": "Note"})
+            ui.styled_table(methods, numeric_format="{:,.2f}")
+        st.caption(
+            f"Anchored on {valuation.get('anchor')} for the "
+            f"{profile.label.lower()} profile. {profile.note}")
+        multiples = pd.DataFrame(
+            [{"Multiple": k, "Value": v}
+             for k, v in (valuation.get("multiples") or {}).items()])
+        if not multiples.empty:
+            ui.styled_table(multiples, numeric_format="{:,.2f}")
+
+    with detail[2]:
+        metric_rows = [{
+            "Metric": key.replace("_", " ").title(),
+            # Rendered through the engine's own formatter so a ratio never
+            # prints as a percentage and a dollar figure never prints raw.
+            "Value": fundamentals.format_metric(fact.value, fact.unit),
+            "Source": fact.source,
+            "Note": (fact.note or "")[:110],
+        } for key, fact in report["metrics"].items()]
+        ui.styled_table(pd.DataFrame(metric_rows))
+        st.caption(
+            "FILED and MARKET are observations. CALCULATED is arithmetic on "
+            "them. PROXY is a stand-in for something with no direct source. "
+            "UNAVAILABLE means the data was not there — never a substituted "
+            "default."
+        )
+
+    with detail[3]:
+        flags = report["earnings_quality"]["flags"]
+        if not flags:
+            ui.alert("No earnings-quality flags raised on the filed numbers.",
+                     "ok")
+        for flag in flags:
+            st.markdown(
+                f'<div style="border-left:3px solid {THEME.amber};'
+                f'background:{THEME.bg_panel};padding:7px 12px;margin:5px 0;">'
+                f'<span style="color:{THEME.amber};font-size:12px;">'
+                f'{flag["flag"]}</span><br>'
+                f'<span style="color:{THEME.muted};font-size:10px;">'
+                f'{flag["detail"]}</span></div>', unsafe_allow_html=True)
+        st.caption(
+            "These are prompts to go and read the filing, not accusations. "
+            "Every one of them has innocent explanations."
+        )
+
+    with detail[4]:
+        assumptions = valuation.get("assumptions", {})
+        provenance = assumptions.get("_provenance", {})
+        rows = [{
+            "Assumption": key.replace("_", " ").title(),
+            "Value": value,
+            "Derivation": provenance.get(key, ""),
+        } for key, value in assumptions.items() if not key.startswith("_")]
+        ui.styled_table(pd.DataFrame(rows), numeric_format="{:,.4f}")
+        ui.alert(
+            "Every row here is a forecast, not a fact. The fair value is only "
+            "as good as these, which is why they are editable above.", "warn")
+
+    with detail[5]:
+        confidence = report["confidence"]
+        ui.metric_row([
+            ui.metric_tile("CONFIDENCE", confidence["score"], subtitle="/100",
+                           value_format="{:.0f}",
+                           accent=THEME.green if confidence["score"] >= 70
+                           else THEME.amber if confidence["score"] >= 50
+                           else THEME.red),
+        ], columns=4)
+        for deduction in confidence["deductions"]:
+            st.markdown(
+                f'<div style="font-size:11px;color:{THEME.muted};'
+                f'padding:3px 0;">−{deduction["points"]:.0f} · '
+                f'{deduction["reason"]}</div>', unsafe_allow_html=True)
+
+        st.markdown("#### NOT AVAILABLE AT ANY PRICE")
+        st.caption(
+            "These are part of a real fundamental assessment and no free "
+            "source carries them. They are excluded from every score rather "
+            "than estimated:"
+        )
+        for item in report.get("unavailable", []):
+            st.caption(f"• {item}")
+
+    st.caption(report["disclaimer"])
+
+
 # ==========================================================================
 # PAGE: NEWS
 # ==========================================================================
@@ -1992,6 +2619,203 @@ def _yield_curve_figure(curve: pd.DataFrame, analysis: Dict[str, Any],
 def _cached_news(categories: Tuple[str, ...], limit_per_feed: int,
                  max_articles: int) -> pd.DataFrame:
     return news.get_news(list(categories), limit_per_feed, max_articles)
+
+
+def _social_accent(band: str) -> str:
+    return getattr(THEME, config.SENTIMENT_BAND_COLOURS.get(band, "muted"),
+                   THEME.muted)
+
+
+def _render_social_sentiment() -> None:
+    """
+    Fused multi-platform sentiment for one ticker.
+
+    Built from the existing components. The one thing this panel must not do
+    is present a fused number without the platform breakdown beside it: the
+    interesting case is when headlines and the crowd point opposite ways, and
+    a single score is exactly where that information goes to die.
+    """
+    ticker = st.session_state.get("ticker", config.DEFAULT_TICKER)
+
+    control, _ = st.columns([1, 3])
+    with control:
+        entered = st.text_input("TICKER", value=ticker, key="social_ticker")
+        entered = equities.normalize_ticker(entered).upper()
+        if entered and entered != ticker:
+            st.session_state["ticker"] = entered
+        ticker = entered or ticker
+
+    if not ticker:
+        ui.alert("Enter a ticker to fuse sentiment across platforms.", "warn")
+        return
+
+    with st.spinner(f"Reading headlines, StockTwits and Reddit for {ticker}…"):
+        report = _safe(social.composite_sentiment, ticker, default={})
+
+    if not report:
+        ui.alert(f"Sentiment fusion unavailable for {ticker}.", "error")
+        return
+
+    band = report["band"]
+    accent = _social_accent(band)
+    score = report["score"]
+    confidence = report["confidence"]
+
+    if score is None:
+        ui.alert(
+            "No platform returned usable data for this ticker, so there is no "
+            "score. That is a gap in coverage, not a neutral reading — the "
+            "two are different claims.", "warn")
+
+    st.markdown(
+        f'<div style="border-left:4px solid {accent};background:{THEME.bg_panel};'
+        f'padding:12px 16px;margin:4px 0 12px 0;">'
+        f'<div style="color:{THEME.muted};font-size:10px;letter-spacing:0.14em;">'
+        f'SOCIAL SENTIMENT · {ticker}</div>'
+        f'<div style="color:{accent};font-size:26px;font-weight:700;'
+        f'letter-spacing:0.08em;">{band}'
+        f'<span style="font-size:16px;color:{THEME.muted};"> &nbsp;'
+        f'{"" if score is None else f"{score:+.2f}"}</span></div></div>',
+        unsafe_allow_html=True,
+    )
+
+    platforms = report["platforms"]
+    ui.metric_row([
+        ui.metric_tile("FUSED SCORE", score, subtitle="-1.00 to +1.00",
+                       value_format="{:+.2f}", accent=accent),
+        ui.metric_tile("CONFIDENCE", confidence["score"], subtitle="0.00 to 1.00",
+                       value_format="{:.2f}",
+                       accent=THEME.green if confidence["score"] >= 0.7
+                       else THEME.amber if confidence["score"] >= 0.45
+                       else THEME.red),
+        ui.metric_tile("INSTITUTIONAL", platforms["institutional"]["score"],
+                       subtitle=f"{platforms['institutional']['samples']} headlines · "
+                                f"{platforms['institutional']['weight']:.0%}",
+                       value_format="{:+.2f}"),
+        ui.metric_tile("RETAIL", platforms["retail"]["score"],
+                       subtitle=f"{platforms['retail']['samples']} posts · "
+                                f"{platforms['retail']['weight']:.0%}",
+                       value_format="{:+.2f}"),
+        ui.metric_tile("REDDIT", platforms["reddit"]["score"],
+                       subtitle=f"{platforms['reddit']['samples']} posts · "
+                                f"{platforms['reddit']['weight']:.0%}",
+                       value_format="{:+.2f}"),
+        ui.metric_tile("BULL / BEAR TAGS",
+                       platforms["retail"].get("tagged"),
+                       subtitle=f"{platforms['retail'].get('bullish_tags', 0)} bull / "
+                                f"{platforms['retail'].get('bearish_tags', 0)} bear",
+                       value_format="{:,.0f}", accent=THEME.cyan),
+    ], columns=6)
+
+    # --- Divergence -------------------------------------------------------
+    divergence = report["signal_divergence"]
+    if divergence:
+        st.markdown("#### SIGNAL DIVERGENCE")
+        for note in divergence:
+            ui.alert(note, "warn")
+    else:
+        ui.alert("Platforms agree within tolerance and all returned data.", "ok")
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("#### BULLISH DRIVERS")
+        for item in report["drivers"].get("bullish", []) or [None]:
+            if item is None:
+                st.caption("None found.")
+                break
+            st.markdown(
+                f'<div style="border-left:2px solid {THEME.green};'
+                f'padding:4px 10px;margin:4px 0;font-size:11px;color:{THEME.cyan};">'
+                f'<span style="color:{THEME.muted};">[{item["platform"]}] '
+                f'{item["sentiment"]:+.2f}</span> {html.escape(item["text"])}</div>',
+                unsafe_allow_html=True)
+    with right:
+        st.markdown("#### BEARISH DRIVERS")
+        for item in report["drivers"].get("bearish", []) or [None]:
+            if item is None:
+                st.caption("None found.")
+                break
+            st.markdown(
+                f'<div style="border-left:2px solid {THEME.red};'
+                f'padding:4px 10px;margin:4px 0;font-size:11px;color:{THEME.cyan};">'
+                f'<span style="color:{THEME.muted};">[{item["platform"]}] '
+                f'{item["sentiment"]:+.2f}</span> {html.escape(item["text"])}</div>',
+                unsafe_allow_html=True)
+
+    drivers = report["drivers"]
+    if not drivers.get("filtered", False) and drivers.get("mentions") is not None:
+        st.caption(
+            f"Only {drivers['mentions']} items named {ticker} directly, too few "
+            "to filter on, so these are drawn from the whole stream and may "
+            "reference other companies."
+        )
+
+    detail = st.tabs(["PLATFORM DETAIL", "CONFIDENCE", "RAW POSTS", "JSON"])
+
+    with detail[0]:
+        rows = [{
+            "Platform": block["platform"],
+            "Score": block["score"],
+            "Samples": block["samples"],
+            "Weight": block["weight"],
+            "Applied": block["applied_weight"],
+            "Note": (block.get("note") or "")[:150],
+        } for block in platforms.values()]
+        ui.styled_table(pd.DataFrame(rows), numeric_format="{:,.3f}",
+                        highlight_columns=["Score"])
+        st.caption(
+            "Applied weight renormalises over the platforms that answered. A "
+            "silent platform is not counted as neutral — that would read as "
+            "'the crowd has no view' when the truth is 'we could not hear "
+            "one of them'."
+        )
+        conflicts = platforms["retail"].get("tag_lexicon_conflicts")
+        if conflicts:
+            st.caption(
+                f"On {conflicts} StockTwits posts the user's own Bull/Bear tag "
+                "contradicted the lexicon's reading of the same text. Lexicons "
+                "were not built for retail slang or sarcasm — where a tag "
+                "exists it is treated as the better evidence."
+            )
+
+    with detail[1]:
+        ui.metric_row([
+            ui.metric_tile("CONFIDENCE", confidence["score"],
+                           value_format="{:.2f}"),
+            ui.metric_tile("COVERAGE", confidence["coverage"],
+                           value_format="{:.2f}"),
+            ui.metric_tile("VOLUME", confidence["volume"],
+                           value_format="{:.2f}"),
+            ui.metric_tile("AGREEMENT", confidence["agreement"],
+                           value_format="{:.2f}"),
+        ], columns=4)
+        for component in confidence["components"]:
+            st.caption(f"• {component}")
+
+    with detail[2]:
+        frames = report.get("frames", {})
+        for label, frame in (("YAHOO HEADLINES", frames.get("institutional")),
+                             ("STOCKTWITS", frames.get("retail")),
+                             ("REDDIT", frames.get("reddit"))):
+            st.markdown(f"**{label}**")
+            if frame is None or frame.empty:
+                st.caption("No data returned.")
+                continue
+            columns = [c for c in ("title", "body", "tag", "label", "sentiment",
+                                   "platform", "subreddit", "source",
+                                   "created_at", "published")
+                       if c in frame.columns]
+            st.dataframe(frame[columns].head(40), use_container_width=True,
+                         hide_index=True, height=220)
+
+    with detail[3]:
+        st.caption(
+            "The report as a JSON-serialisable object — score, band, "
+            "confidence, per-platform breakdown, divergence and drivers."
+        )
+        st.json(social.to_schema(report))
+
+    st.caption(report["disclaimer"])
 
 
 def page_news() -> None:
@@ -2006,7 +2830,8 @@ def page_news() -> None:
         unsafe_allow_html=True,
     )
 
-    tabs = st.tabs(["NEWS FEED", "GDELT OSINT", "TRENDING TERMS"])
+    tabs = st.tabs(["NEWS FEED", "SOCIAL SENTIMENT", "GDELT OSINT",
+                    "TRENDING TERMS"])
 
     # ---- FEED ------------------------------------------------------------
     with tabs[0]:
@@ -2070,8 +2895,12 @@ def page_news() -> None:
             "what to read."
         )
 
-    # ---- GDELT -----------------------------------------------------------
+    # ---- SOCIAL SENTIMENT ------------------------------------------------
     with tabs[1]:
+        _render_social_sentiment()
+
+    # ---- GDELT -----------------------------------------------------------
+    with tabs[2]:
         st.caption(
             "GDELT monitors global news in 65+ languages with a genuinely open "
             "API — no key, no quota page."
@@ -2129,7 +2958,7 @@ def page_news() -> None:
                     ui.news_feed(results, max_rows=60)
 
     # ---- TRENDING --------------------------------------------------------
-    with tabs[2]:
+    with tabs[3]:
         with st.spinner("Analysing corpus…"):
             corpus = _cached_news(tuple(config.RSS_FEEDS), 25, 400)
 
@@ -2268,6 +3097,273 @@ def _brief_stamp(brief: Dict[str, Any]) -> str:
         brief.get("edition", "—"))
 
 
+def _render_allocation(valued: pd.DataFrame) -> None:
+    """
+    Sector exposure against a benchmark, with the dollar moves to close it.
+
+    Every number here is arithmetic on live data: sector labels come from the
+    issuer's own classification, funds are looked through to their published
+    weights, and the benchmark targets are read off a real fund rather than
+    typed into a table that would rot.
+    """
+    if valued is None or valued.empty:
+        ui.alert("Add holdings before running an allocation review.", "warn")
+        return
+
+    choice_col, _ = st.columns([1, 2])
+    with choice_col:
+        benchmark_key = st.selectbox(
+            "BENCHMARK", list(config.ALLOCATION_BENCHMARKS),
+            format_func=lambda k: (f"{config.ALLOCATION_BENCHMARKS[k].label} "
+                                   f"({config.ALLOCATION_BENCHMARKS[k].proxy})"),
+            key="alloc_benchmark")
+
+    with st.spinner("Classifying holdings and reading benchmark weights…"):
+        report = _safe(allocation.rebalance, valued, benchmark_key, default={})
+
+    if not report:
+        ui.alert("Allocation review unavailable.", "error")
+        return
+
+    benchmark = report["benchmark"]
+    st.caption(
+        f"{benchmark.get('label', benchmark_key)} — {benchmark.get('description', '')} "
+        f"Target weights are {benchmark.get('proxy')}'s current published "
+        "sector weightings, read live rather than hardcoded."
+    )
+
+    if report.get("note"):
+        ui.alert(report["note"], "warn")
+
+    exposure = report.get("exposure")
+    if exposure is None or exposure.empty:
+        return
+
+    # --- Headline ---------------------------------------------------------
+    largest = exposure.iloc[0]
+    rows = report.get("rows")
+    biggest_drift = (rows.iloc[0] if isinstance(rows, pd.DataFrame)
+                     and not rows.empty else None)
+
+    ui.metric_row([
+        ui.metric_tile("BOOK VALUE", report.get("total_value"),
+                       subtitle="$ priced", value_format="{:,.0f}"),
+        ui.metric_tile("SECTORS HELD", int(
+            (exposure["sector"] != allocation.UNCLASSIFIED).sum()),
+                       subtitle=f"of {len(config.GICS_SECTORS)} GICS",
+                       value_format="{:,.0f}"),
+        ui.metric_tile("LARGEST SECTOR", largest["weight_pct"],
+                       subtitle=largest["sector"], value_format="{:.1f}"),
+        ui.metric_tile("BIGGEST DRIFT",
+                       biggest_drift["Drift %"] if biggest_drift is not None else None,
+                       subtitle=(biggest_drift["Sector"]
+                                 if biggest_drift is not None else ""),
+                       value_format="{:+.1f}",
+                       accent=THEME.red if biggest_drift is not None
+                       and abs(biggest_drift["Drift %"]) >= config.REBALANCE_MIN_DRIFT_PCT
+                       else THEME.green),
+        ui.metric_tile("UNCLASSIFIED", report.get("unclassified_pct"),
+                       subtitle="% of book", value_format="{:.1f}",
+                       accent=THEME.amber if (report.get("unclassified_pct") or 0) > 5
+                       else THEME.green),
+    ], columns=5)
+
+    if report.get("lookthrough"):
+        names = ", ".join(
+            f"{item['ticker']} ({item['sectors']} sectors, mostly "
+            f"{item['largest']})" for item in report["lookthrough"])
+        st.caption(
+            f"Fund holdings looked through to their constituent sectors: "
+            f"{names}. A fund is not a single-sector position, and filing one "
+            "under its largest sector would overstate that sector by the whole "
+            "position."
+        )
+
+    if report.get("unclassified"):
+        for item in report["unclassified"]:
+            ui.alert(
+                f"{item['ticker']} (${item['market_value']:,.0f}) could not be "
+                f"placed in a sector: {item['reason']} It is excluded from the "
+                "drift maths rather than spread across sectors.", "warn")
+
+    # --- Allocation vs benchmark -----------------------------------------
+    chart = exposure.copy()
+    chart["bar_label"] = [
+        f"{w:.1f}%   ${v:,.0f}"
+        for w, v in zip(chart["weight_pct"], chart["market_value"])]
+
+    left, right = st.columns([1, 1])
+    with left:
+        ui.render_chart(
+            ui.donut(chart, "sector", "market_value",
+                     title="SECTOR SPREAD",
+                     height=int(min(max(150 + 32 * len(chart), 300), 700)),
+                     center_value=f"${report.get('total_value', 0):,.0f}",
+                     center_label="book value"),
+            key="alloc_donut")
+
+    with right:
+        if isinstance(rows, pd.DataFrame) and not rows.empty:
+            drift = rows[rows["Drift %"].abs() > 0.01].copy()
+            drift["bar_label"] = [f"{d:+.1f}pp" for d in drift["Drift %"]]
+            ui.render_chart(
+                ui.exposure_bars(drift, "Sector", "Drift %",
+                                 title=f"DRIFT VS {benchmark.get('label', '')}".upper(),
+                                 suffix="pp",
+                                 height=int(min(max(150 + 32 * len(drift), 260), 700)),
+                                 text_col="bar_label"),
+                key="alloc_drift")
+
+    # --- Actions ----------------------------------------------------------
+    st.markdown("#### REBALANCING ACTIONS")
+    actions = report.get("actions", [])
+    if not actions:
+        ui.alert(
+            f"No sector drifts by more than {config.REBALANCE_MIN_DRIFT_PCT:.0f} "
+            "percentage points. Nothing here is worth the spread and tax to "
+            "fix.", "ok")
+    else:
+        colours = {"TRIM": THEME.red, "ADD": THEME.green, "OPEN": THEME.amber}
+        for action in actions:
+            colour = colours.get(action["action"], THEME.muted)
+            st.markdown(
+                f'<div style="border-left:3px solid {colour};'
+                f'background:{THEME.bg_panel};padding:7px 12px;margin:5px 0;">'
+                f'<span style="color:{colour};font-size:12px;letter-spacing:0.08em;">'
+                f'{action["action"]} · {action["sector"]}</span>'
+                f'<span style="float:right;color:{THEME.amber};font-size:12px;">'
+                f'${action["amount"]:,.0f}</span><br>'
+                f'<span style="color:{THEME.muted};font-size:10px;">'
+                f'{html.escape(action["detail"])}</span></div>',
+                unsafe_allow_html=True)
+
+    detail = st.tabs(["SECTOR TABLE", "CONCENTRATION", "JSON"])
+
+    with detail[0]:
+        ui.render_chart(
+            ui.exposure_bars(chart, "sector", "weight_pct",
+                             title="CURRENT SECTOR EXPOSURE",
+                             height=int(min(max(150 + 32 * len(chart), 260), 700)),
+                             color=THEME.cyan, text_col="bar_label"),
+            key="alloc_current")
+        if isinstance(rows, pd.DataFrame) and not rows.empty:
+            ui.styled_table(rows, numeric_format="{:,.2f}",
+                            highlight_columns=["Drift %", "Adjust $"])
+        st.caption(
+            "Current % is measured over the classified book only. Including "
+            "an unclassified slug in the denominator would understate every "
+            "sector by the same amount and make the whole book look "
+            "underweight."
+        )
+
+    with detail[1]:
+        stats = report.get("concentration", {})
+        ui.metric_row([
+            ui.metric_tile("POSITIONS", stats.get("positions"),
+                           value_format="{:,.0f}"),
+            ui.metric_tile("LARGEST", stats.get("largest"),
+                           subtitle=stats.get("largest_ticker") or "",
+                           value_format="{:.1f}"),
+            ui.metric_tile("TOP 3", stats.get("top3_pct"), subtitle="%",
+                           value_format="{:.1f}"),
+            ui.metric_tile("EFFECTIVE", stats.get("effective_positions"),
+                           subtitle="1/HHI", value_format="{:.1f}"),
+        ], columns=4)
+        st.caption(
+            "Effective positions is 1/HHI — how many equally-weighted names "
+            "the book behaves like. A twenty-name portfolio where one holding "
+            "is 60% has an effective count near three, and that is the number "
+            "that describes the risk."
+        )
+        for flag in stats.get("flags", []):
+            ui.alert(flag, "warn")
+
+    with detail[2]:
+        st.json(allocation.to_schema(report))
+
+    st.caption(report.get("disclaimer", ""))
+
+
+def _render_position_weights(valued: pd.DataFrame) -> None:
+    """
+    Position weights, with the context that makes them mean something.
+
+    The previous version was a bare bar chart at a fixed 280px. Three things
+    were wrong with it and all three were about usability rather than
+    correctness:
+
+      * Fixed height. Six positions got fat bars with dead space; twenty got
+        squashed into unreadable slivers. The height now scales with the row
+        count.
+      * Percent only. "VOO 54.9%" is the less useful half of the answer when
+        the reader wants to know what that is in money. Bars now carry both.
+      * No concentration read. A weight list does not tell you that six
+        positions behave like fewer than three, which is the number that
+        actually describes the risk. The effective count (1/HHI) does.
+
+    It also says out loud when unpriced positions are missing from the
+    picture. They were being dropped silently, so a book with a dead symbol
+    showed weights that summed to 100% of something smaller than the book.
+    """
+    weights = valued.dropna(subset=["weight"])
+    if weights.empty:
+        return
+
+    stats = allocation.concentration(valued)
+
+    ui.metric_row([
+        ui.metric_tile("LARGEST", stats.get("largest"),
+                       subtitle=stats.get("largest_ticker") or "",
+                       value_format="{:.1f}",
+                       accent=THEME.red
+                       if (stats.get("largest") or 0) >= config.POSITION_CONCENTRATION_PCT
+                       else THEME.cyan),
+        ui.metric_tile("TOP 3", stats.get("top3_pct"), subtitle="% of book",
+                       value_format="{:.1f}"),
+        ui.metric_tile("EFFECTIVE POSITIONS", stats.get("effective_positions"),
+                       subtitle=f"of {stats.get('positions', 0)} held · 1/HHI",
+                       value_format="{:.1f}",
+                       accent=THEME.amber
+                       if (stats.get("effective_positions") or 99) < 5
+                       else THEME.green),
+        ui.metric_tile("PRICED", stats.get("positions"),
+                       subtitle=f"of {len(valued)} positions",
+                       value_format="{:,.0f}"),
+    ], columns=4)
+
+    chart = weights[["ticker", "weight", "market_value"]].copy()
+    chart["bar_label"] = [
+        f"{w:.1f}%   ${v:,.0f}" if pd.notna(v) else f"{w:.1f}%"
+        for w, v in zip(chart["weight"], chart["market_value"])]
+
+    # Bars and donut answer different questions and are both worth having:
+    # bars rank and compare precisely, the donut shows share of the whole.
+    bars_col, donut_col = st.columns([3, 2])
+    with bars_col:
+        ui.render_chart(
+            ui.exposure_bars(chart, "ticker", "weight", title="POSITION WEIGHT",
+                             # Roughly one row of breathing room per position,
+                             # floored so a two-name book is not a stub and
+                             # capped so a fifty-name book still fits a screen.
+                             height=int(min(max(150 + 34 * len(chart), 260), 900)),
+                             color=THEME.cyan, text_col="bar_label"),
+            key="pf_weights")
+    with donut_col:
+        total = float(chart["market_value"].sum(skipna=True))
+        ui.render_chart(
+            ui.donut(chart, "ticker", "market_value", title="POSITION SPREAD",
+                     height=int(min(max(150 + 34 * len(chart), 260), 900)),
+                     center_value=f"${total:,.0f}",
+                     center_label="priced book",
+                     # Past a dozen names the slivers stop being readable and
+                     # start being decoration.
+                     max_slices=12),
+            key="pf_weight_donut")
+
+    for flag in stats.get("flags", []):
+        ui.alert(flag, "warn")
+
+
 def page_portfolio() -> None:
     ui.module_header(
         "PORTFOLIO & WATCHLIST",
@@ -2312,7 +3408,8 @@ def page_portfolio() -> None:
                        subtitle=now_sgt.strftime("%a %d %b")),
     ], columns=6)
 
-    tabs = st.tabs(["HOLDINGS", "WATCHLIST", "MORNING BRIEF"])
+    tabs = st.tabs(["HOLDINGS", "ALLOCATION", "WATCHLIST",
+                    "MORNING BRIEF"])
 
     # ---- HOLDINGS --------------------------------------------------------
     with tabs[0]:
@@ -2366,16 +3463,14 @@ def page_portfolio() -> None:
                     f"{unpriced} position(s) returned no quote — check the "
                     "symbol is the one Yahoo lists.", "warn")
 
-            weights = valued.dropna(subset=["weight"])
-            if len(weights) > 1:
-                ui.render_chart(
-                    ui.exposure_bars(weights, "ticker", "weight",
-                                     title="POSITION WEIGHT", height=280,
-                                     color=THEME.cyan),
-                    key="pf_weights")
+            _render_position_weights(valued)
+
+    # ---- ALLOCATION ------------------------------------------------------
+    with tabs[1]:
+        _render_allocation(valued)
 
     # ---- WATCHLIST -------------------------------------------------------
-    with tabs[1]:
+    with tabs[2]:
         st.caption(
             "Symbols you are following but do not hold. `NVDA WATCH` from the "
             "command bar adds one without coming here."
@@ -2405,7 +3500,7 @@ def page_portfolio() -> None:
             )
 
     # ---- MORNING BRIEF ---------------------------------------------------
-    with tabs[2]:
+    with tabs[3]:
         if stored_holdings.empty:
             ui.alert(
                 "The brief is built from your holdings — add positions first.",
@@ -2507,6 +3602,7 @@ ROUTES = {
     "maritime": page_maritime,
     "aviation": page_aviation,
     "macro": page_macro,
+    "fundamentals": page_fundamentals,
     "news": page_news,
     "portfolio": page_portfolio,
     "help": page_help,

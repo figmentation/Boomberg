@@ -294,6 +294,11 @@ _DEFAULT_BUDGETS: Dict[str, Tuple[float, float]] = {
     "worldbank":     (2.0, 4.0),
     "gdelt":         (0.5, 2.0),
     "rss":           (3.0, 6.0),
+    # Reddit answers RSS but 429s readily - three quick probes were enough to
+    # get blocked during development. This is deliberately the slowest bucket
+    # in the table.
+    "reddit":        (0.15, 1.0),   # ~1 per 7s.
+    "stocktwits":    (0.5, 2.0),    # Cloudflare-fronted; no published cap.
     "scrape":        (0.3, 2.0),    # Headless browser targets: be gentle.
     "coingecko":     (0.4, 2.0),    # Free tier ~10-30/min.
     "wikidata":      (1.0, 3.0),    # No published cap; their docs ask for

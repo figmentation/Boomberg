@@ -487,3 +487,61 @@ class TestPeerSelection:
         monkeypatch.setattr(equities, "_constituents", lambda kind, key: None)
 
         assert equities.suggest_peers.__wrapped__("OBSCURE") == ["OBSCURE"]
+
+
+# ==========================================================================
+# Chart styling
+# ==========================================================================
+class TestStyleFigure:
+    """
+    REGRESSION CONTEXT: style_figure used to pass its `title` argument
+    straight to update_layout, including when it was None. That does not mean
+    "no title" - Plotly serialises an empty title object, Plotly.js concludes
+    a title exists, and paints the literal string "undefined" into the chart.
+
+    Every untitled figure carried it: both gauges, the candlestick chart and
+    the sentiment bar. On the recession panel it was the most prominent text
+    on screen, because that gauge reads 0 and draws a zero-length arc
+    whenever nothing is triggered.
+
+    The assertion has to be on the serialised JSON. `layout.title.text` is
+    None either way, so a Python-side check passes while the browser shows
+    "undefined".
+    """
+
+    @pytest.fixture(autouse=True)
+    def _template(self):
+        """style_figure references the "openterm" template, which app.py
+        registers via apply_theme(). Tests never call that."""
+        from ui.terminal_theme import _register_plotly_template
+        _register_plotly_template()
+
+    @staticmethod
+    def _layout(fig):
+        import json
+        return json.loads(fig.to_json())["layout"]
+
+    def test_untitled_figure_serialises_no_title_key(self):
+        import plotly.graph_objects as go
+        from ui.terminal_theme import style_figure
+
+        assert "title" not in self._layout(style_figure(go.Figure(), height=100))
+
+    def test_titled_figure_keeps_its_title(self):
+        import plotly.graph_objects as go
+        from ui.terminal_theme import style_figure
+
+        layout = self._layout(
+            style_figure(go.Figure(), height=100, title="YIELD CURVE"))
+        assert layout["title"]["text"] == "YIELD CURVE"
+
+    def test_gauge_at_zero_has_no_stray_title(self):
+        """The exact figure that shipped the bug: an all-clear recession score."""
+        from ui import components as ui
+
+        figure = ui.gauge(0.0, "COMPOSITE RISK SCORE",
+                          thresholds=[(20, config.THEME.green),
+                                      (45, config.THEME.amber),
+                                      (100, config.THEME.red)])
+        assert "title" not in self._layout(figure)
+        assert figure.data[0].value == 0.0

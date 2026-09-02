@@ -1048,17 +1048,115 @@ def supply_chain_graph(network: Dict[str, Any], height: int = 640) -> go.Figure:
 
     return style_figure(fig, height=height, title="", showlegend=False)
 
+def donut(
+    df: pd.DataFrame,
+    label_col: str,
+    value_col: str,
+    title: str = "",
+    height: int = 340,
+    hole: float = 0.58,
+    center_label: str = "",
+    center_value: str = "",
+    value_prefix: str = "$",
+    max_slices: Optional[int] = None,
+) -> go.Figure:
+    """
+    Share-of-whole donut for sector or position mix.
+
+    Complements `exposure_bars` rather than replacing it: bars rank and
+    compare precisely, a donut answers "how much of the book is this" at a
+    glance. The allocation page shows both because those are different
+    questions.
+
+    Args:
+        max_slices:   Beyond this many, the smallest are pooled into OTHER.
+                      The pooled row keeps its real total and the caption
+                      says how many names are in it - the alternative is
+                      twenty unreadable slivers.
+        center_label: Small caption in the hole.
+        center_value: Large figure in the hole - usually the total, which is
+                      the one number a donut otherwise throws away.
+
+    Slice order is preserved as passed (`sort=False`), so the donut reads in
+    the same order as the table beside it. Plotly's default re-sorts, which
+    silently breaks that correspondence.
+    """
+    if df is None or df.empty or value_col not in df.columns:
+        return style_figure(go.Figure(), height=height, title=title or "NO DATA")
+
+    frame = df[[label_col, value_col]].copy()
+    frame[value_col] = pd.to_numeric(frame[value_col], errors="coerce")
+    frame = frame.dropna(subset=[value_col])
+    frame = frame[frame[value_col] > 0]
+    if frame.empty:
+        return style_figure(go.Figure(), height=height, title=title or "NO DATA")
+
+    frame = frame.sort_values(value_col, ascending=False)
+
+    pooled = 0
+    if max_slices and len(frame) > max_slices:
+        head = frame.head(max_slices - 1)
+        tail = frame.iloc[max_slices - 1:]
+        pooled = len(tail)
+        frame = pd.concat([head, pd.DataFrame([{
+            label_col: f"OTHER ({pooled})",
+            value_col: float(tail[value_col].sum()),
+        }])], ignore_index=True)
+
+    total = float(frame[value_col].sum())
+
+    fig = go.Figure(go.Pie(
+        labels=frame[label_col].astype(str),
+        values=frame[value_col],
+        hole=hole,
+        sort=False,
+        direction="clockwise",
+        textinfo="percent",
+        textposition="inside",
+        insidetextorientation="horizontal",
+        textfont=dict(size=10, family=THEME.font_mono, color=THEME.bg),
+        # A hairline in the page background separates adjacent slices whose
+        # colours are close, which matters on a dark theme where several of
+        # the palette entries are saturated.
+        marker=dict(line=dict(color=THEME.bg, width=1.5)),
+        hovertemplate=("%{label}<br>" + value_prefix +
+                       "%{value:,.0f}  ·  %{percent}<extra></extra>"),
+    ))
+
+    if center_value or center_label:
+        fig.add_annotation(
+            text=(f'<span style="font-size:17px;color:{THEME.white};">'
+                  f'{center_value}</span>'
+                  + (f'<br><span style="font-size:9px;color:{THEME.muted};">'
+                     f'{center_label}</span>' if center_label else "")),
+            showarrow=False, x=0.5, y=0.5, xref="paper", yref="paper",
+            font=dict(family=THEME.font_mono),
+        )
+
+    fig = style_figure(fig, height=height, title=title, showlegend=True)
+    fig.update_layout(
+        legend=dict(orientation="v", x=1.02, y=0.5, yanchor="middle",
+                    font=dict(size=9)),
+        margin=dict(l=8, r=8, t=42, b=8),
+    )
+    return fig
+
+
 def exposure_bars(df: pd.DataFrame, label_col: str, value_col: str,
                   title: str = "", height: int = 300,
-                  suffix: str = "%", color: Optional[str] = None) -> go.Figure:
+                  suffix: str = "%", color: Optional[str] = None,
+                  text_col: Optional[str] = None) -> go.Figure:
     """
     Horizontal bars for revenue-by-region / commodity-correlation panels.
 
     Args:
-        color: One colour for every bar. Pass this for magnitudes that are
-               always positive - portfolio weights, for instance - where the
-               default red/green would paint the whole chart green and imply
-               a gain that isn't being measured.
+        color:    One colour for every bar. Pass this for magnitudes that are
+                  always positive - portfolio weights, for instance - where
+                  the default red/green would paint the whole chart green and
+                  imply a gain that isn't being measured.
+        text_col: Column holding pre-formatted bar labels. Without it a bar
+                  can only say "54.9%", which is the least useful half of the
+                  answer when the reader wants to know what that is in money.
     """
     if df.empty:
         return style_figure(go.Figure(), height=height, title=title)
@@ -1067,10 +1165,14 @@ def exposure_bars(df: pd.DataFrame, label_col: str, value_col: str,
     colors = ([color] * len(frame) if color
               else [THEME.green if v >= 0 else THEME.red for v in frame[value_col]])
 
+    labels = (frame[text_col].astype(str).tolist()
+              if text_col and text_col in frame.columns
+              else [f"{v:,.1f}{suffix}" for v in frame[value_col]])
+
     fig = go.Figure(go.Bar(
         x=frame[value_col], y=frame[label_col], orientation="h",
         marker=dict(color=colors),
-        text=[f"{v:,.1f}{suffix}" for v in frame[value_col]],
+        text=labels,
         textposition="auto",
         hovertemplate="%{y}: %{x:,.2f}" + suffix + "<extra></extra>",
     ))
@@ -1095,4 +1197,5 @@ __all__ = [
     "news_feed", "sentiment_bar",
     "styled_table", "statement_table", "status_bar", "render_chart",
     "social_links", "executive_card", "supply_chain_graph", "exposure_bars",
+    "donut",
 ]

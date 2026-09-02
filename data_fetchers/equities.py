@@ -479,6 +479,11 @@ def get_company_info(ticker: str) -> Dict[str, Any]:
         # Classification keys: the machine-readable form of sector/industry,
         # used to look up the issuer's own peer group.
         "sectorKey", "industryKey",
+        # quoteType distinguishes an EQUITY from an ETF or MUTUALFUND.
+        # Without it the allocation module cannot tell a fund from a company
+        # with a missing sector, and silently files every ETF as
+        # unclassified rather than looking through to its holdings.
+        "quoteType",
         "longBusinessSummary", "fullTimeEmployees", "currency", "exchange",
         "marketCap", "enterpriseValue", "trailingPE", "forwardPE",
         "priceToBook", "priceToSalesTrailing12Months", "enterpriseToEbitda",
@@ -686,8 +691,19 @@ _XBRL_CONCEPTS: Dict[str, Dict[str, List[str]]] = {
         "Income Tax": ["IncomeTaxExpenseBenefit"],
         "Net Income": ["NetIncomeLoss", "ProfitLoss",
                        "NetIncomeLossAvailableToCommonStockholdersBasic"],
-        "EPS Basic": ["EarningsPerShareBasic"],
-        "EPS Diluted": ["EarningsPerShareDiluted"],
+        "EPS Basic": ["EarningsPerShareBasic",
+                      "IncomeLossFromContinuingOperationsPerBasicShare"],
+        # Coca-Cola tags none of the plain EPS concepts - it reports under
+        # the continuing-operations variant. Without the fallback its P/E
+        # based valuations silently drop out of the comparison entirely.
+        "EPS Diluted": ["EarningsPerShareDiluted",
+                        "IncomeLossFromContinuingOperationsPerDilutedShare",
+                        "EarningsPerShareBasicAndDiluted"],
+        # Diluted share count drives the dilution metric in the fundamental
+        # engine. Basic is deliberately NOT a fallback: it excludes exactly
+        # the options and RSUs that dilution is measuring, so a basic count
+        # under a "diluted" heading understates the very thing being tested.
+        "Diluted Shares": ["WeightedAverageNumberOfDilutedSharesOutstanding"],
     },
     "balance_sheet": {
         "Cash & Equivalents": ["CashAndCashEquivalentsAtCarryingValue",
@@ -714,6 +730,12 @@ _XBRL_CONCEPTS: Dict[str, Dict[str, List[str]]] = {
         "Retained Earnings": ["RetainedEarningsAccumulatedDeficit"],
         "Total Equity": ["StockholdersEquity",
                          "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],
+        # Short-term borrowings, for total debt. Filers split this several
+        # ways; the current portion of long-term debt is the most consistent
+        # tag, with commercial paper as the alternate for issuers that fund
+        # there instead.
+        "Short-Term Debt": ["LongTermDebtCurrent", "CommercialPaper",
+                            "ShortTermBorrowings", "OtherShortTermBorrowings"],
     },
     "cash_flow": {
         "Operating Cash Flow": ["NetCashProvidedByUsedInOperatingActivities",
@@ -739,6 +761,12 @@ _XBRL_CONCEPTS: Dict[str, Dict[str, List[str]]] = {
         "Depreciation & Amortization": ["DepreciationDepletionAndAmortization",
                                         "DepreciationAmortizationAndAccretionNet",
                                         "DepreciationAndAmortization"],
+        # A real cost to existing holders even though it never leaves the
+        # cash flow statement, which is why the fundamental engine scores it
+        # against revenue rather than ignoring it the way FCF does.
+        "Stock-Based Compensation": ["ShareBasedCompensation",
+                                     "AllocatedShareBasedCompensationExpense"],
+        "Change in Receivables": ["IncreaseDecreaseInAccountsReceivable"],
     },
 }
 
@@ -859,13 +887,30 @@ def _facts_for_tag(
     if not node:
         return {}
 
-    # Prefer USD; fall back to whatever single unit exists (EPS is USD/shares).
     units = node.get("units", {})
-    unit_key = "USD" if "USD" in units else next(iter(units), None)
-    if not unit_key:
+    if not units:
         return {}
 
     wanted_form = "10-K" if annual else "10-Q"
+
+    # Pick the unit that actually carries facts for the form we want, rather
+    # than the first key in dict order.
+    #
+    # REGRESSION: this used to be `"USD" if "USD" in units else
+    # next(iter(units))`. Coca-Cola tags EarningsPerShareDiluted under BOTH
+    # "pure" (four stray 10-Q facts) and "USD/shares" (fifty-one 10-K facts).
+    # "USD" is not an exact key match, so the fallback took "pure", found no
+    # annual facts in it, and returned nothing - KO's diluted EPS came back
+    # empty from a filing that reports it perfectly well. Every P/E-based
+    # valuation for that issuer then silently dropped out.
+    def usable(unit_key: str) -> int:
+        return sum(1 for fact in units[unit_key]
+                   if str(fact.get("form", "")).startswith(wanted_form))
+
+    preference = {"USD": 2, "USD/shares": 1}
+    unit_key = max(units, key=lambda key: (usable(key), preference.get(key, 0)))
+    if usable(unit_key) == 0:
+        return {}
     out: Dict[str, Tuple[str, float]] = {}
 
     for fact in units[unit_key]:

@@ -410,6 +410,7 @@ MACRO_SERIES: Dict[str, Dict[str, str]] = {
         "PCEPILFE": "Core PCE Price Index (Fed's target)",
         "T10YIE": "10Y Breakeven Inflation Rate",
         "T5YIFR": "5Y-5Y Forward Inflation Expectation",
+        "PPIACO": "Producer Price Index, All Commodities",
     },
     "RATES": {
         "FEDFUNDS": "Effective Federal Funds Rate",
@@ -422,12 +423,14 @@ MACRO_SERIES: Dict[str, Dict[str, str]] = {
         "A191RL1Q225SBEA": "Real GDP % Change QoQ (SAAR)",
         "INDPRO": "Industrial Production Index",
         "RSAFS": "Retail Sales (Advance, SA)",
+        "CFNAI": "Chicago Fed National Activity Index",
     },
     "LABOR": {
         "UNRATE": "Unemployment Rate",
         "PAYEMS": "Nonfarm Payrolls (Total, thousands)",
         "ICSA": "Initial Jobless Claims (weekly)",
         "CIVPART": "Labor Force Participation Rate",
+        "CES0500000003": "Average Hourly Earnings, Private (SA)",
     },
     "LIQUIDITY": {
         "M2SL": "M2 Money Stock",
@@ -442,6 +445,101 @@ MACRO_SERIES: Dict[str, Dict[str, str]] = {
         "T10Y2Y": "10Y minus 2Y Treasury Spread",
         "T10Y3M": "10Y minus 3M Treasury Spread",
     },
+}
+
+# --------------------------------------------------------------------------
+# REGIME MATRIX INPUTS
+# --------------------------------------------------------------------------
+# The composite that decides which macro quadrant we are in. Weights are
+# exposed here for the same reason get_recession_indicators exposes its
+# signal weights: the classification is a judgement, and a judgement whose
+# inputs are buried in code cannot be argued with.
+#
+# `transform` is not cosmetic - see utils/macro_analytics. "pct" series are
+# index levels or counts whose change is a percentage; "level" series are
+# already percentages or standardised indices whose change is a difference in
+# percentage points. CFNAI in particular oscillates around zero, so treating
+# it as "pct" divides by ~0 and produces nonsense.
+#
+# `invert` marks series that RISE as their axis WEAKENS. Initial claims going
+# up is a deteriorating labour market; high-yield spreads widening is
+# tightening financial conditions. Without the flag both would be read as
+# growth accelerating, which inverts the regime call in exactly the
+# conditions where getting it right matters most.
+@dataclass(frozen=True)
+class RegimeInput:
+    series_id: str
+    label: str
+    axis: str            # "growth" | "inflation"
+    transform: str       # "pct" | "level"
+    invert: bool
+    weight: float
+
+
+REGIME_INPUTS: List[RegimeInput] = [
+    # --- Growth ----------------------------------------------------------
+    RegimeInput("CFNAI", "Chicago Fed Activity Index", "growth",
+                "level", False, 1.0),
+    RegimeInput("PAYEMS", "Nonfarm Payrolls", "growth",
+                "pct", False, 1.0),
+    RegimeInput("ICSA", "Initial Jobless Claims", "growth",
+                "pct", True, 0.7),
+    # Financial conditions, NOT the high-yield OAS. FRED serves
+    # BAMLH0A0HYM2 on a rolling ~3-year window only (ICE BofA licence the
+    # index that way), which is too little history for the 36-month z-score
+    # every other contributor uses - it would drop in and out of the vote
+    # depending on the month. NFCI measures the same tightening impulse, is
+    # standardised around zero by construction, and goes back to 1971. The
+    # HY spread is still shown, as context, below.
+    RegimeInput("NFCI", "Financial Conditions (NFCI)", "growth",
+                "level", True, 0.7),
+    # --- Inflation -------------------------------------------------------
+    RegimeInput("PCEPILFE", "Core PCE", "inflation", "pct", False, 1.0),
+    RegimeInput("CPILFESL", "Core CPI", "inflation", "pct", False, 1.0),
+    RegimeInput("T10YIE", "10Y Breakeven", "inflation", "level", False, 0.7),
+    RegimeInput("PPIACO", "PPI, All Commodities", "inflation",
+                "pct", False, 0.7),
+]
+
+# Context series shown in the regime table but not voting on the quadrant -
+# they describe the environment rather than the growth/inflation axes.
+REGIME_CONTEXT: List[RegimeInput] = [
+    RegimeInput("FEDFUNDS", "Fed Funds Rate", "context", "level", False, 0.0),
+    RegimeInput("UNRATE", "Unemployment Rate", "context", "level", True, 0.0),
+    RegimeInput("CES0500000003", "Avg Hourly Earnings", "context",
+                "pct", False, 0.0),
+    RegimeInput("T10Y2Y", "10Y-2Y Spread", "context", "level", False, 0.0),
+    RegimeInput("BAMLH0A0HYM2", "High-Yield OAS", "context",
+                "level", True, 0.0),
+]
+
+# An axis needs this many resolved contributors before it is scored at all.
+# Below it, classify() returns no regime rather than calling the quadrant off
+# a single series that happened to load.
+REGIME_MIN_CONTRIBUTORS: int = 2
+
+# Quadrant -> (label, posture, theme colour attribute).
+REGIME_QUADRANTS: Dict[Tuple[bool, bool], Tuple[str, str, str]] = {
+    # (growth accelerating, inflation accelerating)
+    (True, False): ("GOLDILOCKS", "Risk-On / Equity Bullish", "green"),
+    (True, True): ("OVERHEATING", "Hike Risk / Cash, Real Assets", "amber"),
+    (False, True): ("STAGFLATION", "Defensive / Real Assets", "red"),
+    (False, False): ("DEFLATIONARY BUST", "Bond Bullish / Risk-Off", "cyan"),
+}
+
+# Fed net liquidity = balance sheet - Treasury General Account - reverse repo.
+#
+# THE UNIT TRAP: these three are not all published on the same scale. FRED
+# reports WALCL in millions and the other two in billions, so subtracting the
+# raw series leaves net liquidity within a rounding error of the balance
+# sheet itself - wrong by a factor of 1000 on two of three legs, and the
+# chart still looks entirely reasonable. macro.get_net_liquidity normalises
+# every leg to billions before subtracting and records how it worked the
+# scale out.
+NET_LIQUIDITY_SERIES: Dict[str, str] = {
+    "walcl": "WALCL",
+    "tga": "WTREGEN",
+    "rrp": "RRPONTSYD",
 }
 
 # Yahoo tickers used when FRED is unreachable entirely.
@@ -461,6 +559,292 @@ WORLD_BANK_INDICATORS: Dict[str, str] = {
     "GC.DOD.TOTL.GD.ZS": "Central government debt (% of GDP)",
 }
 
+
+# ==========================================================================
+# MODULE H :: FUNDAMENTAL ANALYSIS
+# ==========================================================================
+# A rule-based screen over filed financials. Descriptive and mechanical, in
+# the same register as get_recession_indicators - not advice, and the UI says
+# so on every surface.
+#
+# Everything that decides a verdict lives in this section rather than in the
+# scoring code, because a judgement whose inputs are buried is a judgement
+# nobody can argue with. Anchors, weights and gates are all editable here.
+
+
+# --------------------------------------------------------------------------
+# DCF assumptions
+# --------------------------------------------------------------------------
+# Every field here is a FORECAST ASSUMPTION, never a fact, and is rendered as
+# such wherever a fair value derived from it is shown.
+@dataclass(frozen=True)
+class DCFDefaults:
+    # Long-run US equity risk premium. Damodaran's implied ERP has spent the
+    # last two decades roughly in the 4-6% band; 5% is the midpoint, not a
+    # forecast. Overridable in the UI.
+    equity_risk_premium: float = 0.05
+
+    horizon_years: int = 10
+
+    # Growth fades linearly from the company's own trailing rate to this over
+    # the horizon. No business compounds at its trailing rate forever, and a
+    # flat-growth DCF quietly asserts that it does.
+    fade_to: float = 0.03
+
+    # Held below long-run nominal GDP on purpose: a terminal rate above it
+    # implies the company eventually becomes the entire economy.
+    terminal_growth: float = 0.025
+
+    # Trailing growth above this is treated as unsustainable and capped. A
+    # 60% FCF CAGR compounded for a decade produces a fair value that is
+    # arithmetically correct and worthless.
+    growth_cap: float = 0.25
+
+    # Discount to base-case fair value required before BUY TRIGGER fires.
+    required_margin_of_safety: float = 0.25
+
+
+DCF = DCFDefaults()
+
+
+# --------------------------------------------------------------------------
+# Score anchors
+# --------------------------------------------------------------------------
+# (metric_value, points) in ascending metric order. Points may descend, which
+# is how "lower is better" metrics are expressed without an inverted code
+# path. See utils/fundamental_math.score_band.
+SCORE_ANCHORS: Dict[str, List[Tuple[float, float]]] = {
+    # --- Business quality (decimals, not percent) -------------------------
+    "gross_margin": [(0.10, 10), (0.25, 35), (0.40, 60), (0.60, 85), (0.80, 100)],
+    "operating_margin": [(0.0, 5), (0.08, 35), (0.15, 60), (0.25, 85), (0.40, 100)],
+    "net_margin": [(0.0, 5), (0.05, 30), (0.12, 60), (0.20, 85), (0.30, 100)],
+    "fcf_margin": [(0.0, 5), (0.05, 30), (0.12, 62), (0.20, 85), (0.30, 100)],
+    "roe": [(0.0, 5), (0.08, 35), (0.15, 65), (0.25, 88), (0.40, 100)],
+    "roic": [(0.0, 0), (0.08, 40), (0.15, 70), (0.25, 90), (0.40, 100)],
+
+    # --- Growth -----------------------------------------------------------
+    "revenue_cagr_3y": [(-0.10, 0), (0.0, 25), (0.05, 50), (0.12, 75), (0.25, 100)],
+    "revenue_cagr_5y": [(-0.10, 0), (0.0, 25), (0.05, 50), (0.12, 75), (0.25, 100)],
+    "eps_cagr_3y": [(-0.15, 0), (0.0, 25), (0.08, 55), (0.15, 80), (0.30, 100)],
+    "fcf_cagr_3y": [(-0.15, 0), (0.0, 25), (0.08, 55), (0.15, 80), (0.30, 100)],
+
+    # --- Financial health -------------------------------------------------
+    # Net debt / EBITDA: negative means net cash, which is the best case.
+    "net_debt_to_ebitda": [(-2.0, 100), (0.0, 92), (1.5, 75), (3.0, 50),
+                           (4.5, 25), (6.0, 5)],
+    "interest_coverage": [(1.0, 5), (2.5, 30), (5.0, 60), (10.0, 85), (20.0, 100)],
+    "current_ratio": [(0.6, 10), (1.0, 40), (1.5, 75), (2.5, 95), (4.0, 85)],
+    "cash_to_debt": [(0.0, 15), (0.25, 45), (0.75, 75), (1.5, 92), (3.0, 100)],
+    # Diluted share count CAGR. Negative is buybacks; positive is dilution.
+    "share_count_cagr": [(-0.05, 100), (-0.01, 82), (0.0, 65), (0.02, 40),
+                         (0.05, 15), (0.10, 0)],
+    "sbc_to_revenue": [(0.0, 100), (0.02, 82), (0.05, 60), (0.10, 30), (0.20, 0)],
+    # Normalised slope of total debt across the filed years. Falling is good.
+    "debt_trend": [(-0.25, 95), (-0.05, 80), (0.0, 65), (0.10, 40), (0.30, 10)],
+
+    # --- Earnings quality -------------------------------------------------
+    "fcf_to_net_income": [(0.0, 0), (0.5, 25), (0.8, 55), (1.0, 80), (1.4, 100)],
+    # (Net income - operating cash flow) / total assets. High = income the
+    # cash flow statement does not corroborate.
+    "accruals_ratio": [(-0.10, 95), (0.0, 80), (0.05, 50), (0.10, 25), (0.20, 0)],
+
+    # --- Valuation (higher points = cheaper) ------------------------------
+    "fcf_yield": [(0.0, 0), (0.02, 25), (0.04, 50), (0.07, 78), (0.12, 100)],
+    "upside_to_base": [(-0.50, 0), (-0.20, 20), (0.0, 45), (0.25, 72),
+                       (0.60, 92), (1.00, 100)],
+    # Current multiple divided by the company's own 5-year median. Below 1.0
+    # means cheaper than its own history.
+    "pe_vs_own_history": [(0.5, 100), (0.8, 82), (1.0, 60), (1.3, 35), (1.8, 10)],
+    "ev_ebitda_vs_own_history": [(0.5, 100), (0.8, 82), (1.0, 60), (1.3, 35),
+                                 (1.8, 10)],
+    "pe_vs_peers": [(0.5, 95), (0.8, 78), (1.0, 58), (1.3, 32), (1.8, 8)],
+    "price_to_book": [(0.5, 95), (1.0, 78), (1.8, 55), (3.0, 32), (6.0, 8)],
+
+    # --- Risk (higher points = MORE risk) ---------------------------------
+    "risk_leverage": [(-1.0, 5), (0.0, 12), (2.0, 30), (3.5, 55), (5.0, 80),
+                      (7.0, 100)],
+    "risk_earnings_quality": [(-0.05, 10), (0.0, 20), (0.05, 50), (0.10, 75),
+                              (0.20, 100)],
+    "risk_valuation": [(-0.30, 5), (0.0, 20), (0.30, 45), (0.75, 75), (1.50, 100)],
+    "risk_dilution": [(-0.03, 8), (0.0, 25), (0.03, 55), (0.07, 80), (0.12, 100)],
+    "risk_beta": [(0.4, 10), (0.8, 25), (1.2, 45), (1.8, 72), (2.5, 95)],
+    "risk_margin_trend": [(-0.25, 95), (-0.08, 70), (0.0, 40), (0.08, 20),
+                          (0.20, 8)],
+}
+
+
+# --------------------------------------------------------------------------
+# Industry profiles
+# --------------------------------------------------------------------------
+# The fix for "do not use identical metrics for every company". A bank has no
+# meaningful Debt/EBITDA, a REIT's net income is buried under depreciation,
+# and a loss-making software company has no usable P/E. Each profile picks
+# which metrics apply, how they are weighted and what the fair value is
+# anchored on.
+#
+# `unavailable` is the honest half: the metrics that profile genuinely wants
+# but free data does not carry. CET1 and insurance solvency live in
+# regulatory filings, not SEC company facts; occupancy and per-unit
+# production cost are narrative disclosures with no tag at all. They are
+# named in the report and they cost confidence, rather than being quietly
+# dropped or approximated into something that looks sourced.
+@dataclass(frozen=True)
+class FundamentalProfile:
+    key: str
+    label: str
+    valuation_anchor: str            # dcf | book | affo | midcycle | growth
+    axis_weights: Dict[str, float]   # business_quality/growth/financial_health
+    skip_metrics: Tuple[str, ...]
+    unavailable: Tuple[str, ...]
+    note: str
+
+
+_GENERIC_AXIS = {"business_quality": 1.0, "growth": 0.8, "financial_health": 0.8}
+
+FUNDAMENTAL_PROFILES: Dict[str, FundamentalProfile] = {
+    "GENERIC": FundamentalProfile(
+        key="GENERIC", label="General corporate", valuation_anchor="dcf",
+        axis_weights=_GENERIC_AXIS, skip_metrics=(), unavailable=(),
+        note="Standard corporate metric set: DCF anchored, cross-checked "
+             "against the company's own and its peers' multiples.",
+    ),
+    "BANK": FundamentalProfile(
+        key="BANK", label="Bank / lender", valuation_anchor="book",
+        axis_weights={"business_quality": 1.2, "growth": 0.5,
+                      "financial_health": 1.0},
+        # A bank funds itself with deposits and debt by design. Net
+        # debt/EBITDA, interest coverage and the current ratio are not weak
+        # readings for a bank, they are category errors, and free cash flow
+        # is not a meaningful concept on a balance sheet that IS the product.
+        skip_metrics=("net_debt_to_ebitda", "interest_coverage",
+                      "current_ratio", "cash_to_debt", "fcf_margin",
+                      "fcf_cagr_3y", "fcf_to_net_income", "fcf_yield",
+                      "risk_leverage"),
+        unavailable=("CET1 capital ratio", "Net interest margin (true, on "
+                     "earning assets)", "Non-performing loan ratio",
+                     "Loan loss reserve coverage"),
+        note="Anchored on price/book against ROE, the standard lens for a "
+             "lender. Regulatory capital is not in SEC company facts.",
+    ),
+    "INSURANCE": FundamentalProfile(
+        key="INSURANCE", label="Insurance", valuation_anchor="book",
+        axis_weights={"business_quality": 1.2, "growth": 0.5,
+                      "financial_health": 1.0},
+        skip_metrics=("net_debt_to_ebitda", "interest_coverage",
+                      "current_ratio", "fcf_margin", "fcf_cagr_3y",
+                      "fcf_to_net_income", "risk_leverage"),
+        unavailable=("Solvency / RBC ratio", "Reserve development",
+                     "Catastrophe exposure"),
+        note="Anchored on price/book against ROE. A combined ratio is "
+             "computed where the underwriting tags are filed, and reported "
+             "as unavailable where they are not.",
+    ),
+    "REIT": FundamentalProfile(
+        key="REIT", label="Real estate / REIT", valuation_anchor="affo",
+        axis_weights={"business_quality": 0.9, "growth": 0.7,
+                      "financial_health": 1.2},
+        # Depreciation dominates a REIT's income statement, so net-income
+        # derived margins and EPS growth describe accounting rather than the
+        # business. FFO replaces them.
+        skip_metrics=("net_margin", "eps_cagr_3y", "fcf_to_net_income",
+                      "gross_margin"),
+        unavailable=("Net asset value (NAV)", "Occupancy rate",
+                     "Same-store NOI growth", "Lease expiry schedule"),
+        note="Anchored on price/AFFO, and scored on FFO margin rather than "
+             "net margin. Return on equity is reported but reads low for "
+             "every REIT by construction - depreciation on property held at "
+             "cost. NAV and occupancy are not tagged anywhere.",
+    ),
+    "COMMODITY": FundamentalProfile(
+        key="COMMODITY", label="Energy / materials", valuation_anchor="midcycle",
+        axis_weights={"business_quality": 0.9, "growth": 0.5,
+                      "financial_health": 1.2},
+        # Trailing growth on a cyclical is a statement about where in the
+        # cycle the window happened to fall, not about the business.
+        skip_metrics=("revenue_cagr_3y", "eps_cagr_3y"),
+        unavailable=("Per-unit production cost", "Reserve life / replacement",
+                     "Realised price vs benchmark", "Hedge book"),
+        note="Anchored on mid-cycle margins rather than trailing earnings: "
+             "a cyclical priced off peak or trough profits is mispriced by "
+             "construction.",
+    ),
+    "HIGH_GROWTH_TECH": FundamentalProfile(
+        key="HIGH_GROWTH_TECH", label="High-growth technology",
+        valuation_anchor="growth",
+        axis_weights={"business_quality": 1.0, "growth": 1.2,
+                      "financial_health": 0.7},
+        # Trailing P/E on a company reinvesting everything into growth is
+        # either negative or meaninglessly large; neither is informative.
+        skip_metrics=("pe_vs_own_history", "pe_vs_peers"),
+        unavailable=("Net revenue retention", "Customer acquisition cost",
+                     "Backlog / RPO"),
+        note="Anchored on EV/sales and price/FCF with dilution weighted "
+             "heavily: stock-based compensation is a real cost to holders "
+             "even when it never touches the cash flow statement.",
+    ),
+}
+
+# Yahoo sectorKey/industryKey fragments -> profile. Matched against the
+# issuer's own classification, never against a hand-written ticker list.
+PROFILE_SECTOR_MAP: Dict[str, str] = {
+    "banks": "BANK",
+    "banks-diversified": "BANK",
+    "banks-regional": "BANK",
+    "capital-markets": "BANK",
+    "financial-data-stock-exchanges": "GENERIC",
+    "insurance": "INSURANCE",
+    "insurance-life": "INSURANCE",
+    "insurance-property-casualty": "INSURANCE",
+    "insurance-brokers": "GENERIC",
+    "insurance-reinsurance": "INSURANCE",
+    "insurance-specialty": "INSURANCE",
+    "real-estate": "REIT",
+    "energy": "COMMODITY",
+    "basic-materials": "COMMODITY",
+    "oil-gas-integrated": "COMMODITY",
+    "oil-gas-e-p": "COMMODITY",
+}
+
+# A technology or communication-services name growing revenue faster than
+# this is scored on the high-growth profile instead of the generic one.
+HIGH_GROWTH_REVENUE_CAGR = 0.20
+
+
+# --------------------------------------------------------------------------
+# Verdict gates
+# --------------------------------------------------------------------------
+# Deliberately NOT a single summed score. The brief these were written for is
+# explicit that a low P/E must not by itself produce BUY and a high P/E must
+# not by itself produce SELL - and one number cannot express "cheap but
+# deteriorating", which is the case that matters most. So the verdict is a
+# gate on three axes evaluated in order, first match wins.
+#
+# quality = weighted(business quality, growth, financial health)
+# value   = valuation score, multi-method, vs the company's own history
+# risk    = risk score, where HIGHER IS WORSE
+VERDICT_RULES: List[Tuple[str, Dict[str, float]]] = [
+    ("STRONG SELL", {"max_quality": 35.0, "max_value": 15.0}),
+    ("SELL", {"max_quality": 45.0}),
+    ("SELL", {"max_value": 20.0}),
+    ("STRONG BUY", {"min_quality": 75.0, "min_value": 70.0, "max_risk": 40.0}),
+    ("BUY", {"min_quality": 60.0, "min_value": 55.0, "max_risk": 55.0}),
+]
+VERDICT_DEFAULT = "HOLD"
+
+# Two red flags on a business already scoring under this force STRONG SELL
+# regardless of how cheap it looks. Cheapness caused by deteriorating
+# accounting is not an opportunity.
+RED_FLAG_STRONG_SELL_QUALITY = 50.0
+RED_FLAG_STRONG_SELL_COUNT = 2
+
+VERDICT_COLOURS: Dict[str, str] = {
+    "STRONG BUY": "green", "BUY": "green", "HOLD": "amber",
+    "SELL": "red", "STRONG SELL": "red", "INSUFFICIENT DATA": "muted",
+}
+
+# Below this confidence the report shows INSUFFICIENT DATA instead of a
+# verdict. A recommendation off half-missing financials is worse than none.
+CONFIDENCE_FLOOR = 40.0
 
 # ==========================================================================
 # MODULE E :: NEWS / OSINT
@@ -506,6 +890,77 @@ RSS_FEEDS: Dict[str, List[Tuple[str, str]]] = {
     ],
 }
 
+# --------------------------------------------------------------------------
+# SOCIAL SENTIMENT
+# --------------------------------------------------------------------------
+# Three streams, fused into one score. Institutional framing from Yahoo
+# headlines, retail conviction from StockTwits (where users tag their own
+# posts Bullish or Bearish), and speculative positioning from Reddit.
+#
+# ENDPOINT NOTES, both learned the hard way:
+#
+#   StockTwits sits behind Cloudflare and REJECTS PLAIN_USER_AGENT with a
+#   "Just a moment..." challenge page. It needs a descriptive or browser UA.
+#   That is the exact opposite of FRED's fredgraph.csv, which hangs forever
+#   when sent a browser UA - see PLAIN_USER_AGENT above. Two endpoints in
+#   this codebase with contradictory requirements; neither is negotiable.
+#
+#   Reddit's .json API returns 403 to everything without OAuth. The .rss
+#   endpoints still answer, but rate-limit hard - three quick probes during
+#   development were enough to earn a 429. Hence the slowest token bucket in
+#   utils/rate_limiter and a long cache TTL.
+STOCKTWITS_STREAM_URL = "https://api.stocktwits.com/api/2/streams/symbol/{symbol}.json"
+
+# Reddit search, per subreddit, as RSS. `restrict_sr` keeps results inside the
+# subreddit; `t=week` bounds the window so a dead ticker does not return
+# three-year-old posts as current sentiment.
+REDDIT_SEARCH_URL = (
+    "https://www.reddit.com/r/{subreddit}/search.rss"
+    "?q={query}&restrict_sr=1&sort=new&t=week"
+)
+
+SOCIAL_SUBREDDITS: Tuple[str, ...] = ("wallstreetbets", "stocks", "investing")
+
+# Platform weights for the fused score. Institutional and retail are equal by
+# design: neither leads the other reliably, and the interesting signal is
+# usually where they disagree.
+SENTIMENT_WEIGHTS: Dict[str, float] = {
+    "institutional": 0.35,   # Yahoo Finance headlines
+    "retail": 0.35,          # StockTwits, including explicit Bull/Bear tags
+    "reddit": 0.30,          # r/wallstreetbets, r/stocks, r/investing
+}
+
+# StockTwits users tag their own posts. A self-declared Bull/Bear tag is a
+# stronger signal than a lexicon's reading of the same text, so tags carry
+# most of the platform score when they exist - but not all of it, because
+# only about half of posts carry one.
+STOCKTWITS_TAG_WEIGHT = 0.70
+
+# (lower_bound, label). Evaluated top down, first match wins.
+SENTIMENT_BANDS: List[Tuple[float, str]] = [
+    (0.60, "EXTREMELY BULLISH"),
+    (0.20, "MODERATELY BULLISH"),
+    (-0.19, "NEUTRAL / MIXED"),
+    (-0.59, "MODERATELY BEARISH"),
+    (-1.00, "EXTREMELY BEARISH"),
+]
+
+SENTIMENT_BAND_COLOURS: Dict[str, str] = {
+    "EXTREMELY BULLISH": "green",
+    "MODERATELY BULLISH": "green",
+    "NEUTRAL / MIXED": "amber",
+    "MODERATELY BEARISH": "red",
+    "EXTREMELY BEARISH": "red",
+}
+
+# Sample count at which a platform's volume contribution to confidence is
+# considered full. Below it, confidence scales down proportionally.
+SENTIMENT_VOLUME_TARGET: int = 25
+
+# Gap between two platform scores beyond which they are reported as
+# diverging. 0.5 on a -1..+1 scale is roughly a full band apart.
+SENTIMENT_DIVERGENCE_THRESHOLD: float = 0.50
+
 GDELT_DOC_API = "https://api.gdeltproject.org/api/v2/doc/doc"
 
 # Extra finance-specific terms VADER doesn't know. Scores are on VADER's
@@ -531,6 +986,102 @@ FINANCE_LEXICON: Dict[str, float] = {
 # COMMAND BAR
 # ==========================================================================
 # Bloomberg-style function suffixes -> internal module route.
+# ==========================================================================
+# MODULE J :: ALLOCATION & REBALANCING
+# ==========================================================================
+# The eleven GICS sectors, in the standard order.
+GICS_SECTORS: Tuple[str, ...] = (
+    "Information Technology",
+    "Financials",
+    "Health Care",
+    "Consumer Discretionary",
+    "Communication Services",
+    "Industrials",
+    "Consumer Staples",
+    "Energy",
+    "Utilities",
+    "Real Estate",
+    "Materials",
+)
+
+# Yahoo does NOT publish GICS. It ships its own eleven-sector taxonomy that
+# lines up one-for-one but names six of them differently, and it spells them
+# two ways: title case in `info["sector"]` ("Consumer Cyclical") and
+# snake_case in an ETF's `funds_data.sector_weightings` ("consumer_cyclical").
+#
+# Both forms are normalised through this table. Treating "Technology" and
+# "Information Technology" as different sectors would split one exposure
+# across two rows and make every benchmark comparison wrong - quietly, since
+# each row on its own looks perfectly reasonable.
+YAHOO_TO_GICS: Dict[str, str] = {
+    "technology": "Information Technology",
+    "informationtechnology": "Information Technology",
+    "financialservices": "Financials",
+    "financial": "Financials",
+    "financials": "Financials",
+    "healthcare": "Health Care",
+    "consumercyclical": "Consumer Discretionary",
+    "consumerdiscretionary": "Consumer Discretionary",
+    "communicationservices": "Communication Services",
+    "industrials": "Industrials",
+    "consumerdefensive": "Consumer Staples",
+    "consumerstaples": "Consumer Staples",
+    "energy": "Energy",
+    "utilities": "Utilities",
+    "realestate": "Real Estate",
+    "basicmaterials": "Materials",
+    "materials": "Materials",
+}
+
+
+# Benchmark strategies. Each names a real, liquid fund whose CURRENT sector
+# weights are fetched live rather than typed in here.
+#
+# This matters more than it looks. Index sector weights move constantly -
+# technology has run from roughly a quarter to well over a third of the S&P
+# 500 in a few years - so a hardcoded target table is wrong the day after it
+# is written and gets more wrong every month, while continuing to render a
+# confident-looking "drift vs benchmark" column. Reading the weights off the
+# fund means the benchmark is whatever the benchmark actually is today.
+@dataclass(frozen=True)
+class AllocationBenchmark:
+    key: str
+    label: str
+    proxy: str          # the fund whose published sector weights define it
+    description: str
+
+
+ALLOCATION_BENCHMARKS: Dict[str, AllocationBenchmark] = {
+    "SP500": AllocationBenchmark(
+        key="SP500", label="S&P 500", proxy="SPY",
+        description="Broad US large-cap. The default reference for a "
+                    "diversified equity book."),
+    "TECH_GROWTH": AllocationBenchmark(
+        key="TECH_GROWTH", label="Tech Growth", proxy="QQQ",
+        description="Nasdaq-100. Concentrated in technology and "
+                    "communication services by construction - drift against "
+                    "it is not the same as drift against the market."),
+    "INCOME_DEFENSIVE": AllocationBenchmark(
+        key="INCOME_DEFENSIVE", label="Income / Defensive", proxy="SCHD",
+        description="Dividend-quality tilt. Overweight staples, health care "
+                    "and energy; structurally light on high-multiple tech."),
+    "VALUE": AllocationBenchmark(
+        key="VALUE", label="Large-Cap Value", proxy="VTV",
+        description="Value factor. Financials and health care heavy."),
+}
+
+DEFAULT_BENCHMARK = "SP500"
+
+# Drift below this many percentage points is treated as noise and produces no
+# action. Rebalancing a 0.4pp gap costs spread and tax to fix a rounding
+# difference, and a list of thirty trivial "actions" buries the two that
+# matter.
+REBALANCE_MIN_DRIFT_PCT: float = 2.0
+
+# Absolute weight beyond which a single position is flagged regardless of
+# sector. Concentration risk is a property of the position, not the sector.
+POSITION_CONCENTRATION_PCT: float = 20.0
+
 COMMAND_FUNCTIONS: Dict[str, str] = {
     # Equities
     "EQUITY": "equity", "EQ": "equity", "GP": "equity", "DES": "equity",
@@ -544,14 +1095,20 @@ COMMAND_FUNCTIONS: Dict[str, str] = {
     "FLY": "aviation", "FLIGHT": "aviation", "AIR": "aviation",
     # Macro
     "MACRO": "macro", "ECO": "macro", "YCRV": "macro", "CURVE": "macro",
+    # Fundamental analysis
+    "FA": "fundamentals", "FUND": "fundamentals", "VAL": "fundamentals",
+    "REGIME": "macro", "RGM": "macro",
     # News
     "NEWS": "news", "N": "news", "TOP": "news", "OSINT": "news",
+    # Social sentiment fusion
+    "SOCIAL": "news", "SENT": "news", "BUZZ": "news",
     # Portfolio. Bloomberg's mnemonic for this is PORT, but PORT is already
     # bound to the maritime module here and rebinding it would break muscle
     # memory that already exists.
     "PF": "portfolio", "PORTFOLIO": "portfolio", "HOLD": "portfolio",
     "HOLDINGS": "portfolio", "WATCH": "portfolio", "WL": "portfolio",
     "BRIEF": "portfolio", "AM": "portfolio",
+    "ALLOC": "portfolio", "ALLOCATION": "portfolio", "REBAL": "portfolio",
     # Home
     "HOME": "home", "MENU": "home", "DASH": "home",
 }

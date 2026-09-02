@@ -557,8 +557,14 @@ def _register_plotly_template() -> None:
             bgcolor=THEME.bg_raised, bordercolor=THEME.amber,
             font=dict(family=THEME.font_mono, color=THEME.cyan, size=11),
         ),
+        # Twelve entries, not eight. Plotly cycles this list, so a chart with
+        # more series than colours repeats them - and on a pie that means two
+        # slices of the same colour, which reads as one category split in
+        # two. There are eleven GICS sectors, so eight was one short of the
+        # commonest case in this app.
         colorway=[THEME.amber, THEME.cyan, THEME.green, THEME.magenta,
-                  "#FF8C00", "#8A2BE2", "#00CED1", "#ADFF2F"],
+                  "#FF8C00", "#8A2BE2", "#00CED1", "#ADFF2F",
+                  "#1E90FF", "#FF4500", "#DDA0DD", "#7FFFD4"],
         margin=dict(l=54, r=22, t=38, b=38),
         hovermode="x unified",
         dragmode="pan",
@@ -583,15 +589,28 @@ AMBER_SCALE = [
 def style_figure(fig: go.Figure, height: int = 420,
                  title: Optional[str] = None,
                  showlegend: bool = True) -> go.Figure:
-    """Apply the standard terminal chart layout to any figure."""
+    """
+    Apply the standard terminal chart layout to any figure.
+
+    `title` is applied only when the caller supplies one. Passing
+    `title=None` straight through to `update_layout` does NOT mean "no
+    title" - Plotly builds a title object whose text is undefined, and
+    Plotly.js then paints the literal string "undefined" into the chart.
+    Every untitled figure carried it: the recession composite gauge, the
+    maritime congestion gauge, the candlestick chart and the sentiment bar.
+    On the recession panel, which reads 0 and draws a zero-length arc
+    whenever nothing is triggered, a stray "undefined" was the only
+    prominent text on screen and the whole panel looked broken.
+    """
     fig.update_layout(
         template="openterm",
         height=height,
         showlegend=showlegend,
-        title=title,
         modebar=dict(bgcolor="rgba(0,0,0,0)", color=THEME.muted,
                      activecolor=THEME.amber),
     )
+    if title is not None:
+        fig.update_layout(title=title)
     return fig
 
 
