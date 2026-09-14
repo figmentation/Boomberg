@@ -28,7 +28,7 @@ runs — headlines just score `+0.00` across the board. See
 | **Supply Chain** | `AAPL SPLC` | Named customers from the 10-K (anonymised ones reported as anonymised, never guessed), reported revenue by region, commodity dependency as return correlations, and Altman Z-score credit risk — every edge traced to a filing |
 | **Macro** | `YCRV` `REGIME` `CPI ECO` | Growth/inflation regime matrix, full 11-tenor Treasury curve, inversion detection, composite recession score, inflation and labour dashboards, Fed net liquidity, FRED series browser, World Bank cross-country data |
 | **Maritime** | `SUEZ SHIP` | AIS vessel positions, 7 chokepoint congestion monitors scored against locally measured baselines, MMSI/IMO lookup, custom area scans |
-| **Aviation** | `EUROPE FLY` | Live ADS-B state vectors, fleet tracking by ICAO operator designator, aircraft tracks, airport throughput |
+| **Aviation** | `EUROPE FLY` | Live ADS-B state vectors drawn as light-blue dots, fleet tracking by ICAO operator designator, aircraft tracks, airport throughput |
 | **Portfolio** | `PF` `ALLOC` `BRIEF` | Holdings and watchlist editor, mark-to-market in one base currency (SGX, London and other non-USD listings converted at live FX), position concentration, GICS sector exposure with ETF look-through, rebalancing against a live benchmark, and an 08:00 SGT morning brief with a written summary of the book |
 | **News** | `NEWS` `AAPL SOCIAL` | 21 RSS feeds + GDELT, sentiment scoring, trending-term extraction, and multi-platform sentiment fusion across headlines, StockTwits and Reddit |
 
@@ -66,7 +66,7 @@ demo portfolio in place of real holdings. Click any image for full size.
   </tr>
   <tr>
     <td valign="top"><img src="docs/images/morning-brief.png" alt="Morning brief"><br><b>Morning brief</b> — the 08:00 SGT edition: a written summary of the whole book, then stories ranked by sentiment strength times position weight.</td>
-    <td valign="top"><img src="docs/images/aviation.png" alt="Aviation live traffic over Europe"><br><b>Aviation</b> — live ADS-B traffic from OpenSky's anonymous tier, with fleet, track and airport-flow tabs. The aircraft markers are drawn with WebGL, which the headless browser used for these captures did not paint, so the map looks empty here.</td>
+    <td valign="top"><img src="docs/images/aviation.png" alt="Aviation live traffic over Europe"><br><b>Aviation</b> — live ADS-B traffic from OpenSky's anonymous tier, one light-blue dot per aircraft, with fleet, track and airport-flow tabs.</td>
   </tr>
   <tr>
     <td valign="top"><img src="docs/images/maritime.png" alt="Maritime chokepoint monitor without an AIS key"><br><b>Maritime</b> — shown without an AISStream key: the module says so and lists the source options instead of drawing an empty map.</td>
@@ -496,7 +496,7 @@ Free data sources fail constantly. Three layers handle it:
 ## Tests
 
 ```bash
-pytest                # 559 offline tests, ~5s
+pytest                # 566 offline tests, ~5s
 pytest -m network     # 11 live tests against SEC EDGAR and Yahoo
 pytest -m "" -q       # everything
 ```
@@ -518,6 +518,7 @@ outage trains you to ignore failures.
 | `test_portfolio_fx.py` | Base-currency conversion of SGX and London listings, native price kept, a missing FX rate or quote currency left unpriced (never treated as 1.0), pence units, configurable base currency, the FX and quote-currency fetchers, re-deriving brief summaries written before conversion |
 | `test_portfolio_brief.py` | Book snapshot totals and day %, no cost basis means no P&L rather than zero, narrative clauses dropped when their inputs are missing, unpriced positions named, legacy editions backfilled without refetching headlines |
 | `test_sectors.py` | Sector weight = industry share × member share, zero-weight members and failed industries, backfilled sector leaders, literal (non-regex) search, unrated and uncapped filters, heatmap tile → GICS mapping, clickable tiles and selection parsing |
+| `test_maps.py` | Aircraft markers on the live traffic map: one light-blue colour whatever the altitude or speed, circle symbols (the only ones a map trace will colour), no colour scale, heading kept in the hover card, empty feeds |
 
 The two indicator/XBRL files are **regression suites, not coverage padding**.
 Both bugs they guard were invisible in the UI — the chart drew a plausible
@@ -580,6 +581,14 @@ contact string. User-Agent is selected per host.
 **OpenSky auth.** Basic auth is deprecated; the API moved to OAuth2
 client-credentials. Anonymous access still works at a quarter of the quota and
 10-second resolution instead of 5.
+
+**Map markers only take a colour as circles.** On a Plotly map trace, any
+`marker.symbol` other than `"circle"` is drawn from the basemap style's Maki
+icon sprite and ignores `marker.color` — Plotly's own docstring says so, in a
+sentence that is easy to miss. The FLY map drew heading-rotated triangles
+coloured by altitude, and on carto-darkmatter every one rendered black:
+several thousand aircraft over Europe looked like an empty map. Aircraft are
+now light-blue circles, with heading moved into the hover card.
 
 **Free-data limits worth knowing.** Prices are delayed. AIS coverage is thin
 outside major lanes. OpenSky's receiver network is sparse over oceans and much
