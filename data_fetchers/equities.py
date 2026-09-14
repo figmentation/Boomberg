@@ -1333,12 +1333,25 @@ def get_options_chain(ticker: str, expiry: Optional[str] = None) -> Dict[str, An
 # ==========================================================================
 # HELPERS
 # ==========================================================================
+# The only single-letter exchange suffixes Yahoo uses: TSX Venture, Frankfurt,
+# Tokyo and London. Every other exchange code is two or more letters, so a
+# lone letter after a dot is otherwise a share class. Matches both Yahoo's
+# published suffix table and yfinance's own MIC -> suffix map.
+_SINGLE_LETTER_EXCHANGES = frozenset({"V", "F", "T", "L"})
+
+
 def normalize_ticker(ticker: str) -> str:
     """
     Coerce user input into a Yahoo-compatible symbol.
 
     Handles the common cases: whitespace, lowercase, Bloomberg-style
     "AAPL US Equity", and the class-share dot/dash mismatch (BRK.B -> BRK-B).
+
+    A US share class whose letter is also an exchange code reads as the
+    exchange when typed with a dot: MKC.V is kept as a TSX Venture symbol, so
+    McCormick's voting stock has to be typed the way Yahoo lists it, MKC-V.
+    The asymmetry decides it - a share class has a dash spelling that passes
+    through untouched, and an exchange listing has no other spelling at all.
     """
     if not ticker:
         return ""
@@ -1353,10 +1366,14 @@ def normalize_ticker(ticker: str) -> str:
         t = parts[0]
 
     # Yahoo uses '-' for share classes; users type '.'. But leave real
-    # suffixes alone (.TO, .L, .HK, ...) - those are exchange codes.
+    # suffixes alone (.TO, .L, .HK, ...) - those are exchange codes. Length
+    # alone only protects the two-letter ones: without the named set, VOD.L
+    # became VOD-L, which Yahoo does not list, and every London, Frankfurt,
+    # Tokyo and TSX Venture holding silently returned no quote.
     if "." in t:
         root, _, suffix = t.rpartition(".")
-        if len(suffix) == 1 and suffix.isalpha():
+        if (len(suffix) == 1 and suffix.isalpha()
+                and suffix not in _SINGLE_LETTER_EXCHANGES):
             t = f"{root}-{suffix}"
 
     return t

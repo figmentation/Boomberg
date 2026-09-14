@@ -117,6 +117,75 @@ class TestNormalizeTicker:
         assert equities.normalize_ticker("CL=F") == "CL=F"
         assert equities.normalize_ticker("BTC-USD") == "BTC-USD"
 
+    # Yahoo's single-letter exchange suffixes. Two-letter codes were never at
+    # risk; these four were rewritten to a dash - a symbol Yahoo does not
+    # list - and the holding silently returned no quote.
+    @pytest.mark.parametrize("raw,expected", [
+        ("VOD.L", "VOD.L"),          # London
+        ("vod.l", "VOD.L"),
+        ("SAP.F", "SAP.F"),          # Frankfurt
+        ("7203.T", "7203.T"),        # Tokyo, numeric root
+        ("FUU.V", "FUU.V"),          # TSX Venture
+        ("RY.TO", "RY.TO"),          # multi-letter codes, unchanged
+        ("D05.SI", "D05.SI"),
+        ("0700.HK", "0700.HK"),
+    ])
+    def test_exchange_suffixes_preserved(self, raw, expected):
+        assert equities.normalize_ticker(raw) == expected
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("BRK.A", "BRK-A"),
+        ("HEI.A", "HEI-A"),
+        ("LEN.B", "LEN-B"),
+        ("MOG.A", "MOG-A"),
+        ("BRK-B", "BRK-B"),          # already in Yahoo form
+        # A class letter that is also an exchange code: the dot form reads as
+        # TSX Venture, and the dash form - how Yahoo lists it - passes through.
+        ("MKC.V", "MKC.V"),
+        ("MKC-V", "MKC-V"),
+    ])
+    def test_share_classes_still_dashed(self, raw, expected):
+        assert equities.normalize_ticker(raw) == expected
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("VOD.L", "VOD.L"),
+        ("VOD.L EQUITY", "VOD.L"),
+        ("brk.b equity", "BRK-B"),
+    ])
+    def test_command_bar_route(self, raw, expected):
+        """What the command bar does: parse, then normalise the subject."""
+        import app
+        subject = app.parse_command(raw)["subject"]
+        assert equities.normalize_ticker(subject) == expected
+
+    def test_single_letter_set_matches_yfinance(self):
+        """
+        The named set is reference data. Checked against yfinance's own MIC
+        map, so an exchange Yahoo adds or drops fails here rather than as a
+        holding that quietly stops quoting.
+        """
+        from yfinance import const
+
+        mapping = getattr(const, "_MIC_TO_YAHOO_SUFFIX", None)
+        if not mapping:
+            pytest.skip("yfinance no longer ships a MIC -> suffix map")
+        single = {suffix.lstrip(".") for suffix in mapping.values()
+                  if isinstance(suffix, str) and len(suffix.lstrip(".")) == 1}
+        assert single == equities._SINGLE_LETTER_EXCHANGES
+
+    @pytest.mark.network
+    @pytest.mark.parametrize("raw", ["VOD.L", "SAP.F", "7203.T", "FUU.V", "BRK.B"])
+    def test_normalised_symbol_quotes_live(self, raw):
+        """The normalised form is the one Yahoo actually lists."""
+        import yfinance as yf
+
+        symbol = equities.normalize_ticker(raw)
+        try:
+            bars = yf.Ticker(symbol).history(period="5d")
+        except Exception as exc:
+            pytest.skip(f"Yahoo unreachable: {exc}")
+        assert not bars.empty, f"{raw} -> {symbol} returned no data"
+
 
 class TestFormatLargeNumber:
     @pytest.mark.parametrize("value,expected", [
