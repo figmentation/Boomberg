@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 import config
-from data_fetchers import equities, news
+from data_fetchers import allocation, equities, news
 
 log = logging.getLogger("openterm.portfolio")
 
@@ -383,6 +383,250 @@ def _float_or_none(value: Any) -> Optional[float]:
     return None if pd.isna(number) else number
 
 
+# ==========================================================================
+# 5. THE BOOK SUMMARY
+# ==========================================================================
+# Net sentiment beyond this reads as a lean rather than noise. Shared with the
+# brief's PORTFOLIO MOOD tile so the paragraph and the tile never disagree.
+MOOD_THRESHOLD = 0.15
+
+
+def mood_label(net: Optional[float]) -> str:
+    """RISK-ON, RISK-OFF or MIXED for a net sentiment score."""
+    if net is not None and net > MOOD_THRESHOLD:
+        return "RISK-ON"
+    if net is not None and net < -MOOD_THRESHOLD:
+        return "RISK-OFF"
+    return "MIXED"
+
+
+def _sector_mix(positions: pd.DataFrame) -> pd.DataFrame:
+    """Sector exposure, or nothing - a failed lookup must not sink the brief."""
+    try:
+        return allocation.sector_exposure(positions)
+    except Exception as exc:
+        log.warning("Brief: sector exposure failed: %s", exc)
+        return pd.DataFrame()
+
+
+def _extreme(frame: pd.DataFrame, column: str,
+             largest: bool) -> Optional[Dict[str, Any]]:
+    if column not in frame.columns:
+        return None
+    rows = frame.dropna(subset=[column])
+    if rows.empty:
+        return None
+    row = rows.loc[rows[column].idxmax() if largest else rows[column].idxmin()]
+    return {"ticker": str(row["ticker"]), column: float(row[column])}
+
+
+def book_snapshot(positions: pd.DataFrame,
+                  sectors: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
+    """
+    The whole book in plain JSON types, as the paragraph needs it.
+
+    Stored with the edition so an archived brief describes the book as it was
+    that morning, not as it is when someone reopens it a week later.
+    """
+    if positions is None or positions.empty:
+        return {}
+
+    totals = portfolio_summary(positions)
+    stats = allocation.concentration(positions)
+
+    # portfolio_summary sums with skipna, so a book with no day moves or no
+    # cost basis at all totals to 0.0. Zero is a claim; absent is honest.
+    day_pnl = (totals.get("day_pnl")
+               if positions["day_pnl"].notna().any() else None)
+    cost = totals.get("cost")
+    pnl = totals.get("pnl") if cost else None
+    market_value = totals.get("market_value")
+    prior = (market_value - day_pnl
+             if market_value is not None and day_pnl is not None else None)
+
+    limit = config.POSITION_CONCENTRATION_PCT
+    weights = positions.dropna(subset=["weight"])
+
+    book: Dict[str, Any] = {
+        "as_of": sgt_now().isoformat(timespec="seconds"),
+        "positions": len(positions),
+        "priced": int(positions["price"].notna().sum()),
+        "with_basis": int(positions["cost"].notna().sum()),
+        "market_value": market_value,
+        "day_pnl": day_pnl,
+        "day_pct": (day_pnl / prior * 100.0) if prior else None,
+        "cost": cost,
+        "pnl": pnl,
+        "pnl_pct": totals.get("pnl_pct") if pnl is not None else None,
+        "largest_ticker": stats.get("largest_ticker"),
+        "largest": _float_or_none(stats.get("largest")),
+        "top3_pct": _float_or_none(stats.get("top3_pct")),
+        "effective_positions": _float_or_none(stats.get("effective_positions")),
+        "over_limit": [str(t) for t in
+                       weights.loc[weights["weight"] >= limit, "ticker"]],
+        "day_best": _extreme(positions, "change_pct", largest=True),
+        "day_worst": _extreme(positions, "change_pct", largest=False),
+        "return_best": _extreme(positions, "pnl_pct", largest=True),
+        "return_worst": _extreme(positions, "pnl_pct", largest=False),
+        "unpriced": [str(t) for t in
+                     positions.loc[positions["price"].isna(), "ticker"]],
+        "sectors": [],
+        "unclassified_pct": None,
+    }
+
+    if sectors is not None and not sectors.empty:
+        unclassified = sectors["sector"] == allocation.UNCLASSIFIED
+        book["sectors"] = [
+            {"sector": str(row["sector"]), "weight_pct": float(row["weight_pct"])}
+            for _, row in sectors[~unclassified].head(3).iterrows()]
+        if unclassified.any():
+            book["unclassified_pct"] = float(
+                sectors.loc[unclassified, "weight_pct"].sum())
+
+    return book
+
+
+def _money(value: float) -> str:
+    return f"${abs(value):,.0f}"
+
+
+def _join(items: List[str]) -> str:
+    if len(items) <= 1:
+        return "".join(items)
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def compose_narrative(book: Optional[Dict[str, Any]],
+                      summary: Optional[Dict[str, Any]] = None,
+                      digests: Optional[List[Dict[str, Any]]] = None) -> str:
+    """
+    One paragraph on the whole book, written from the numbers.
+
+    Every clause is conditional on the figure behind it existing. A sentence
+    that says "0.0% above cost" for a book with no cost basis entered reads
+    exactly like a real result, so a missing input drops the clause instead.
+    """
+    if not book or not book.get("positions"):
+        return ""
+    summary = summary or {}
+    digests = digests or []
+    sentences: List[str] = []
+
+    count = book["positions"]
+    noun = "position" if count == 1 else "positions"
+    priced = book.get("priced", 0)
+
+    # --- Value and P&L ----------------------------------------------------
+    value = book.get("market_value")
+    if value is None:
+        sentences.append(f"None of your {count} {noun} returned a quote, so "
+                         "the book cannot be valued this edition.")
+    else:
+        text = f"Your book of {count} {noun} is worth {_money(value)}"
+        day = book.get("day_pnl")
+        if day is not None:
+            text += f", {'up' if day >= 0 else 'down'} {_money(day)}"
+            if book.get("day_pct") is not None:
+                text += f" ({book['day_pct']:+.2f}%)"
+            text += " on the last session"
+        pnl = book.get("pnl")
+        if pnl is not None:
+            text += f", and sits {_money(pnl)}"
+            if book.get("pnl_pct") is not None:
+                text += f" ({book['pnl_pct']:+.1f}%)"
+            text += f" {'above' if pnl >= 0 else 'below'} cost"
+            with_basis = book.get("with_basis", 0)
+            if with_basis < priced:
+                text += (f" on the {with_basis} of {priced} priced positions "
+                         "with a cost basis entered")
+        sentences.append(text + ".")
+
+    # --- Concentration ----------------------------------------------------
+    largest = book.get("largest_ticker")
+    if largest and book.get("largest") is not None and priced > 1:
+        text = (f"{largest} is the largest holding at {book['largest']:.1f}% "
+                "of the book")
+        if priced >= 3 and book.get("top3_pct") is not None:
+            text += f" and the top three make up {book['top3_pct']:.1f}%"
+        effective = book.get("effective_positions")
+        if effective is not None:
+            text += (f", so the {priced} priced names behave like roughly "
+                     f"{effective:.1f} equally weighted positions")
+            if effective < 5:
+                text += ", which is a concentrated book"
+        sentences.append(text + ".")
+
+    # A one-name book is trivially 100% of itself; flagging it is noise.
+    over = book.get("over_limit") or []
+    if over and priced > 1:
+        sentences.append(
+            f"{_join(over)} {'is' if len(over) == 1 else 'are'} above the "
+            f"{config.POSITION_CONCENTRATION_PCT:.0f}% single-position marker.")
+
+    # --- Sectors ----------------------------------------------------------
+    sectors = book.get("sectors") or []
+    if sectors:
+        parts = [f"{s['sector']} ({s['weight_pct']:.1f}%)" for s in sectors]
+        text = f"By sector it leans towards {_join(parts)}"
+        unclassified = book.get("unclassified_pct")
+        if unclassified is not None and unclassified >= 0.5:
+            text += (f", with {unclassified:.1f}% that could not be placed "
+                     "in a sector")
+        sentences.append(text + ".")
+
+    # --- Movers -----------------------------------------------------------
+    best, worst = book.get("day_best"), book.get("day_worst")
+    if best and worst and best["ticker"] != worst["ticker"]:
+        sentences.append(
+            f"On the day {best['ticker']} led at {best['change_pct']:+.2f}% "
+            f"while {worst['ticker']} was weakest at "
+            f"{worst['change_pct']:+.2f}%.")
+    elif best:
+        sentences.append(
+            f"On the day {best['ticker']} moved {best['change_pct']:+.2f}%.")
+
+    best, worst = book.get("return_best"), book.get("return_worst")
+    if best and worst and best["ticker"] != worst["ticker"]:
+        sentences.append(
+            f"Since purchase {best['ticker']} is the best performer at "
+            f"{best['pnl_pct']:+.1f}% and {worst['ticker']} the weakest at "
+            f"{worst['pnl_pct']:+.1f}%.")
+    elif best:
+        sentences.append(
+            f"Since purchase {best['ticker']} is at {best['pnl_pct']:+.1f}%.")
+
+    # --- News -------------------------------------------------------------
+    stories = summary.get("stories") or 0
+    net = summary.get("net_sentiment")
+    if stories and net is not None:
+        tone = {"RISK-ON": "lean positive", "RISK-OFF": "lean negative",
+                "MIXED": "are mixed"}[mood_label(net)]
+        text = (f"Headlines across {stories} stories {tone} "
+                f"(net sentiment {net:+.2f})")
+        scored = [d for d in digests if d.get("net_sentiment") is not None]
+        leans = []
+        if scored:
+            high = max(scored, key=lambda d: d["net_sentiment"])
+            low = min(scored, key=lambda d: d["net_sentiment"])
+            if high["net_sentiment"] > MOOD_THRESHOLD:
+                leans.append(f"most constructive on {high['ticker']}")
+            if low["net_sentiment"] < -MOOD_THRESHOLD:
+                leans.append(f"most negative on {low['ticker']}")
+        if leans:
+            text += ", " + " and ".join(leans)
+        sentences.append(text + ".")
+
+    # --- Gaps -------------------------------------------------------------
+    unpriced = book.get("unpriced") or []
+    if unpriced and value is not None:
+        sentences.append(
+            f"No quote came back for {_join(unpriced)}, so "
+            f"{'it is' if len(unpriced) == 1 else 'they are'} left out of "
+            "every figure above.")
+
+    return " ".join(sentences)
+
+
 def build_brief(edition: Optional[date] = None) -> Dict[str, Any]:
     """
     Assemble the edition from whatever the portfolio holds right now.
@@ -400,6 +644,7 @@ def build_brief(edition: Optional[date] = None) -> Dict[str, Any]:
             "edition": edition.isoformat(),
             "built_at": sgt_now().isoformat(timespec="seconds"),
             "empty": True,
+            "book": {}, "narrative": "",
             "positions": [], "top_stories": [],
             "summary": {"symbols": 0, "stories": 0, "net_sentiment": None},
         }
@@ -446,20 +691,33 @@ def build_brief(edition: Optional[date] = None) -> Dict[str, Any]:
         [d for d in digests if d.get("change_pct") is not None],
         key=lambda d: abs(d["change_pct"]), reverse=True)[:3]
 
+    summary = {
+        "symbols": len(digests),
+        "stories": sum(len(d["stories"]) for d in digests),
+        "net_sentiment": (sum(scored) / len(scored)) if scored else None,
+        "movers": [{"ticker": m["ticker"], "change_pct": m["change_pct"]}
+                   for m in movers],
+    }
+    book = book_snapshot(positions, _sector_mix(positions))
+
     return {
         "edition": edition.isoformat(),
         "built_at": sgt_now().isoformat(timespec="seconds"),
         "empty": False,
+        "book": book,
+        "narrative": compose_narrative(book, summary, digests),
         "positions": digests,
         "top_stories": top_stories[:12],
-        "summary": {
-            "symbols": len(digests),
-            "stories": sum(len(d["stories"]) for d in digests),
-            "net_sentiment": (sum(scored) / len(scored)) if scored else None,
-            "movers": [{"ticker": m["ticker"], "change_pct": m["change_pct"]}
-                       for m in movers],
-        },
+        "summary": summary,
     }
+
+
+def _persist(path, brief: Dict[str, Any]) -> None:
+    try:
+        config.BRIEF_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(brief, indent=2), encoding="utf-8")
+    except Exception as exc:
+        log.warning("Could not persist brief %s: %s", path.stem, exc)
 
 
 def get_brief(force: bool = False) -> Dict[str, Any]:
@@ -468,22 +726,30 @@ def get_brief(force: bool = False) -> Dict[str, Any]:
 
     Reads from disk when the current edition already exists, so reruns - and
     Streamlit reruns constantly - never refetch a book's worth of headlines.
+
+    An edition written before the book summary existed gets one added rather
+    than being rebuilt: the headlines are the expensive half, and they are
+    already on disk.
     """
     edition = edition_date()
     path = _brief_path(edition)
 
     if path.exists() and not force:
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            brief = json.loads(path.read_text(encoding="utf-8"))
         except Exception as exc:
             log.warning("Brief %s unreadable, rebuilding: %s", edition, exc)
+        else:
+            if "book" not in brief and not brief.get("empty"):
+                positions = value_positions(holdings())
+                brief["book"] = book_snapshot(positions, _sector_mix(positions))
+                brief["narrative"] = compose_narrative(
+                    brief["book"], brief.get("summary"), brief.get("positions"))
+                _persist(path, brief)
+            return brief
 
     brief = build_brief(edition)
-    try:
-        config.BRIEF_DIR.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(brief, indent=2), encoding="utf-8")
-    except Exception as exc:
-        log.warning("Could not persist brief %s: %s", edition, exc)
+    _persist(path, brief)
     return brief
 
 
@@ -505,4 +771,5 @@ __all__ = [
     "value_positions", "portfolio_summary", "watchlist_quotes",
     "sgt_now", "edition_date", "next_edition_at", "stored_editions",
     "build_brief", "get_brief", "load_edition",
+    "MOOD_THRESHOLD", "mood_label", "book_snapshot", "compose_narrative",
 ]

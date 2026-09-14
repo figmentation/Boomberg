@@ -3533,8 +3533,26 @@ def page_portfolio() -> None:
 
         summary_block = brief.get("summary", {})
         net = summary_block.get("net_sentiment")
-        mood = ("RISK-ON" if (net or 0) > 0.15 else
-                "RISK-OFF" if (net or 0) < -0.15 else "MIXED")
+        mood = portfolio.mood_label(net)
+
+        st.markdown("###### YOUR PORTFOLIO THIS MORNING")
+        narrative = brief.get("narrative")
+        if narrative:
+            as_of = str(brief.get("book", {}).get("as_of", ""))[:16].replace("T", " ")
+            st.markdown(
+                f'<div style="border-left:3px solid {THEME.cyan};'
+                f'background:{THEME.bg_panel};padding:12px 16px;margin:4px 0 10px;'
+                f'font-size:13px;line-height:1.65;color:{THEME.white};">'
+                f'{html.escape(narrative)}'
+                + (f'<div style="margin-top:8px;font-size:10px;color:{THEME.muted};">'
+                   f'Book figures as of {as_of} SGT</div>' if as_of else "")
+                + '</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.caption(
+                "This edition was built before the portfolio summary existed, "
+                "so it carries headlines only.")
 
         st.markdown(
             f'<div style="border-left:3px solid {THEME.amber};padding:6px 10px;'
