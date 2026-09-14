@@ -22,16 +22,57 @@ runs — headlines just score `+0.00` across the board. See
 
 | Module | Command | Capability |
 |---|---|---|
+| **Home** | `HOME` | Market overview: index, commodity and crypto tiles, macro-regime banner, Treasury curve, top headlines, chokepoint status, and a daily sector heatmap you can **click into** to browse and filter the companies in that sector |
+| **Equity** | `AAPL EQUITY` | Candlesticks + EMA/RSI/MACD/Bollinger/ATR, as-reported financials from SEC XBRL, the SEC filings index, comparables from the issuer's own industry classification, options chains, per-ticker news, named executives with disclosed pay, and official social handles from Wikidata |
 | **Fundamentals** | `AAPL FA` | Explainable BUY/HOLD/SELL verdict: business quality, financial health, earnings quality and multi-method intrinsic value, adapted per industry profile |
-| **Equity** | `AAPL EQUITY` | Candlesticks + EMA/RSI/MACD/Bollinger/ATR, as-reported financials from SEC XBRL, comparables from the issuer's own industry classification, options chains, per-ticker news |
-| **Macro** | `YCRV` `REGIME` | Growth/inflation regime matrix, full 11-tenor Treasury curve, inversion detection, composite recession score, Fed net liquidity, FRED series browser, World Bank cross-country data |
+| **Supply Chain** | `AAPL SPLC` | Named customers from the 10-K (anonymised ones reported as anonymised, never guessed), reported revenue by region, commodity dependency as return correlations, and Altman Z-score credit risk — every edge traced to a filing |
+| **Macro** | `YCRV` `REGIME` `CPI ECO` | Growth/inflation regime matrix, full 11-tenor Treasury curve, inversion detection, composite recession score, inflation and labour dashboards, Fed net liquidity, FRED series browser, World Bank cross-country data |
 | **Maritime** | `SUEZ SHIP` | AIS vessel positions, 7 chokepoint congestion monitors scored against locally measured baselines, MMSI/IMO lookup, custom area scans |
 | **Aviation** | `EUROPE FLY` | Live ADS-B state vectors, fleet tracking by ICAO operator designator, aircraft tracks, airport throughput |
-| **Portfolio** | `PF` `ALLOC` | Mark-to-market holdings, position concentration, GICS sector exposure with ETF look-through, and rebalancing actions against a live benchmark |
+| **Portfolio** | `PF` `ALLOC` `BRIEF` | Holdings and watchlist editor, mark-to-market in one base currency (SGX, London and other non-USD listings converted at live FX), position concentration, GICS sector exposure with ETF look-through, rebalancing against a live benchmark, and an 08:00 SGT morning brief with a written summary of the book |
 | **News** | `NEWS` `AAPL SOCIAL` | 21 RSS feeds + GDELT, sentiment scoring, trending-term extraction, and multi-platform sentiment fusion across headlines, StockTwits and Reddit |
 
 Command bar accepts Bloomberg-style syntax: `<SUBJECT> <FUNCTION>`. Type `HELP`
-for the full reference.
+for the full reference. Every module is pictured under
+[Screenshots](#screenshots).
+
+---
+
+## Screenshots
+
+Captured at 1920×1080 from a fresh install — no API keys set, and a made-up
+demo portfolio in place of real holdings. Click any image for full size.
+
+<table>
+  <tr>
+    <td width="50%" valign="top"><img src="docs/images/home.png" alt="Home market overview"><br><b>Home</b> — index, commodity and crypto tiles, the macro regime banner, the Treasury curve, top headlines and chokepoint status.</td>
+    <td width="50%" valign="top"><img src="docs/images/sector-drilldown.png" alt="Technology sector drill-down"><br><b>Sector drill-down</b> — click a tile on the daily heatmap to browse that sector's companies, with search, industry, rating and size filters, live prices and a row that opens straight into EQUITY.</td>
+  </tr>
+  <tr>
+    <td valign="top"><img src="docs/images/equity.png" alt="NVDA equity chart"><br><b>Equity</b> — candlesticks with EMAs, volume, RSI and MACD, plus tabs for fundamentals, SEC filings, peers, options, news, people, supply chain and profile.</td>
+    <td valign="top"><img src="docs/images/fundamentals.png" alt="MSFT fundamental verdict"><br><b>Fundamental verdict</b> — a mechanical BUY/HOLD/SELL with per-axis scores, a bear/base/bull value range, the reasons and risks behind it, and a warning when valuation methods disagree.</td>
+  </tr>
+  <tr>
+    <td valign="top"><img src="docs/images/supply-chain.png" alt="AAPL supply chain network map"><br><b>Supply chain</b> — counterparties mined from the issuer's own filings; a customer the 10-K does not name is shown as undisclosed rather than guessed.</td>
+    <td valign="top"><img src="docs/images/macro-regime.png" alt="Macro regime matrix"><br><b>Macro regime</b> — the growth/inflation quadrant with every contributing series, its momentum z-score and weight. Net liquidity stays blank without a FRED key.</td>
+  </tr>
+  <tr>
+    <td valign="top"><img src="docs/images/news.png" alt="OSINT news terminal"><br><b>News</b> — headlines from the RSS desks scored for sentiment, with mood and bullish/bearish counts.</td>
+    <td valign="top"><img src="docs/images/social-sentiment.png" alt="NVDA social sentiment fusion"><br><b>Social sentiment</b> — headlines, StockTwits and Reddit fused into one score. Reddit was rate-limiting when this was taken, so its weight renormalised over the two platforms that answered instead of counting as neutral.</td>
+  </tr>
+  <tr>
+    <td valign="top"><img src="docs/images/portfolio.png" alt="Portfolio holdings in USD"><br><b>Portfolio</b> — holdings marked to market in one base currency. D05.SI is quoted in SGD and converted at the live rate named under the table.</td>
+    <td valign="top"><img src="docs/images/allocation.png" alt="Sector allocation and rebalancing"><br><b>Allocation</b> — GICS sector exposure with ETF look-through, drift against a live benchmark and the rebalancing actions it implies.</td>
+  </tr>
+  <tr>
+    <td valign="top"><img src="docs/images/morning-brief.png" alt="Morning brief"><br><b>Morning brief</b> — the 08:00 SGT edition: a written summary of the whole book, then stories ranked by sentiment strength times position weight.</td>
+    <td valign="top"><img src="docs/images/aviation.png" alt="Aviation live traffic over Europe"><br><b>Aviation</b> — live ADS-B traffic from OpenSky's anonymous tier, with fleet, track and airport-flow tabs. The aircraft markers are drawn with WebGL, which the headless browser used for these captures did not paint, so the map looks empty here.</td>
+  </tr>
+  <tr>
+    <td valign="top"><img src="docs/images/maritime.png" alt="Maritime chokepoint monitor without an AIS key"><br><b>Maritime</b> — shown without an AISStream key: the module says so and lists the source options instead of drawing an empty map.</td>
+    <td></td>
+  </tr>
+</table>
 
 ---
 
@@ -78,8 +119,11 @@ data_fetchers/
   aviation.py           OpenSky OAuth2 + state vectors
   news.py               RSS + GDELT + VADER/FinBERT sentiment
   social.py             StockTwits + Reddit -> fused sentiment score
-  portfolio.py          Holdings, mark-to-market, morning brief
+  supply_chain.py       10-K counterparties, SEC report tables, Altman Z
+  company_intel.py      Named executives + Wikidata social handles
+  portfolio.py          Holdings, FX-converted mark-to-market, morning brief
   allocation.py         GICS exposure, ETF look-through, rebalancing
+  sectors.py            Sector constituents behind the home heatmap drill-down
 ui/
   terminal_theme.py     Bloomberg palette, CSS, Plotly template
   components.py         Tape, tiles, charts, donuts, news feed, tables
@@ -353,6 +397,85 @@ There are eleven GICS sectors, and Plotly cycles the list — so eight
 colours put two slices in the same shade, which reads as one category
 split in two.
 
+### Multi-currency portfolios
+
+Yahoo quotes each listing in its exchange's currency — D05.SI in SGD, VOO in
+USD, a London line in pence — and cost basis is entered in that same listing
+currency, because that is what the broker statement shows. Adding those
+figures straight together produces a total in no currency at all, which is
+exactly what the portfolio page used to do behind a "$". Every position is now
+converted into one base currency (`OPENTERM_BASE_CURRENCY`, default `USD`) at
+the live `{CCY}{BASE}=X` rate before anything is summed:
+
+- **The native price stays visible.** LAST and BASIS still match the
+  statement; day P&L, market value, cost and P&L are in the base currency, and
+  the caption under the table names the rate that was applied.
+- **A missing rate is not a rate of 1.0.** If the FX cross or a listing's
+  quote currency cannot be fetched, the position is left unpriced and says
+  why (`no SGD to USD rate`) rather than being added in at a guessed rate —
+  which would quietly recreate the original bug on the one day the cross
+  failed to load.
+- **Quote currency, not reporting currency.** PDD reports in CNY and trades in
+  USD. The price is what gets multiplied by a quantity, so the price's
+  currency is the one used.
+- **Minor units.** London quotes in GBp, so a price of 250 there is 2.50
+  pounds before the GBP cross is applied.
+- **Exchange suffixes survive.** `VOD.L`, `SAP.F`, `7203.T` and `FUU.V` stay as
+  typed; only US share classes are rewritten to Yahoo's dash form
+  (`BRK.B` → `BRK-B`). A lone `.V` is read as TSX Venture, so McCormick's
+  voting stock has to be entered as `MKC-V`.
+
+P&L converts both legs at today's rate, so it is the local-market return
+expressed in the base currency. The currency move since purchase is not in
+it: the rate on the purchase date was never recorded.
+
+### Sector drill-down
+
+Click any tile on the home heatmap and that sector's companies open underneath
+it: search by ticker or name, filter by industry, analyst rating and minimum
+market cap, sort by any column, and select a row to open the company in
+`EQUITY`.
+
+- **Weights are read, not typed.** Constituents come from Yahoo's sector and
+  industry tables. A company's share of the sector is its published share of
+  its industry times the industry's published share of the sector.
+- **A partial list is labelled as one.** Yahoo publishes up to fifty of the
+  largest companies per industry. Technology lists 353 of the 853 companies
+  Yahoo counts — but those 353 cover 99.3% of the sector's market cap. The
+  panel always shows listed-versus-counted and value covered, and names any
+  industry that failed to load instead of silently shrinking the list.
+- **Market cap is marked approximate.** `≈ MKT CAP` is the sector weight times
+  the sector's total cap, which lands within a few percent of a company's own
+  figure (NVDA: $5,067B derived against $5,271B reported).
+- **Prices are fetched for the 150 largest matches**
+  (`config.SECTOR_PRICE_LIMIT`). A whole industrials list runs to several
+  hundred names — too slow to reprice on every filter change — so narrowing
+  the filter prices the rest.
+
+Plotly cannot select heatmap cells and Streamlit only reports selectable
+points, so each tile carries an invisible marker at its centre that owns the
+hover and the click. Every cell gets one, including the S&P 500 tile, which
+is the whole market rather than a sector and deliberately opens nothing.
+
+### The morning brief
+
+`BRIEF` is an *edition*, not a background job. Asking a Streamlit app to run
+something at 08:00 assumes a process is alive at 08:00, which for a local
+terminal is exactly when it is not. Each edition is stamped with the SGT
+trading day it belongs to: before 08:00 SGT you are reading yesterday's, and
+the first page load at or after 08:00 builds today's and saves it. Open the
+terminal at 07:00, 08:00 or noon and you read the same document.
+
+Stories are ranked by sentiment strength times position weight, so a mildly
+negative story about a third of the book outranks a loud headline about a 2%
+position. The edition opens with a written paragraph on the whole book —
+value, day move, P&L against cost, concentration, sector lean, the day's
+movers and headline tone. Every clause is conditional on the figure behind it
+existing: a book with no cost basis entered does not get a sentence saying it
+is "0.0% above cost", because that reads exactly like a real result. The
+figures are stored with the edition, so an archived brief describes the book
+as it was that morning.
+
 ### Resilience
 
 Free data sources fail constantly. Three layers handle it:
@@ -373,8 +496,8 @@ Free data sources fail constantly. Three layers handle it:
 ## Tests
 
 ```bash
-pytest                # 446 offline tests, ~8s
-pytest -m network     # 6 live tests against SEC EDGAR
+pytest                # 559 offline tests, ~5s
+pytest -m network     # 11 live tests against SEC EDGAR and Yahoo
 pytest -m "" -q       # everything
 ```
 
@@ -387,11 +510,14 @@ outage trains you to ignore failures.
 | `test_indicators.py` | RSI/ATR against a textbook Wilder loop, EMA/MACD/Bollinger identities, empty and short-frame edges |
 | `test_xbrl.py` | SEC period labelling, duration/form filtering, restatements, live accounting identities |
 | `test_resilience.py` | Circuit breaker states and fail-fast timing, retry/backoff, token bucket, cache TTL and stale-on-error, measured congestion baselines |
-| `test_domain.py` | Command parser, ticker normalisation, AIS sentinels and MMSI flags, yield-curve analysis, sentiment, derived peer selection, chart title serialisation |
+| `test_domain.py` | Command parser, ticker normalisation including exchange suffixes (`.L` `.F` `.T` `.V`) versus share classes, AIS sentinels and MMSI flags, yield-curve analysis, sentiment, derived peer selection, chart title serialisation |
 | `test_fundamentals.py` | Score anchors and renormalisation, DCF guards, the two verdict constraints, XBRL unit selection, SEC/Yahoo row aliases, normalised FCF base, provenance |
 | `test_social.py` | Sentiment bands, weight renormalisation over silent platforms, confidence from coverage/volume/agreement, divergence detection, tag-vs-lexicon direction, driver ticker filtering |
 | `test_allocation.py` | GICS crosswalk both Yahoo spellings, ETF look-through vs single-sector filing, unclassified excluded from the drift denominator, action thresholds and OPEN-vs-ADD, effective position count |
 | `test_macro_regime.py` | Frequency alignment and LOCF direction, z-scores, the percent-vs-percentage-point transform trap, ragged-edge truncation, quadrant mapping and sign conventions, FRED unit scaling |
+| `test_portfolio_fx.py` | Base-currency conversion of SGX and London listings, native price kept, a missing FX rate or quote currency left unpriced (never treated as 1.0), pence units, configurable base currency, the FX and quote-currency fetchers, re-deriving brief summaries written before conversion |
+| `test_portfolio_brief.py` | Book snapshot totals and day %, no cost basis means no P&L rather than zero, narrative clauses dropped when their inputs are missing, unpriced positions named, legacy editions backfilled without refetching headlines |
+| `test_sectors.py` | Sector weight = industry share × member share, zero-weight members and failed industries, backfilled sector leaders, literal (non-regex) search, unrated and uncapped filters, heatmap tile → GICS mapping, clickable tiles and selection parsing |
 
 The two indicator/XBRL files are **regression suites, not coverage padding**.
 Both bugs they guard were invisible in the UI — the chart drew a plausible
