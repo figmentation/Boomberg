@@ -422,12 +422,18 @@ def heatmap(
     title: str = "",
     height: int = 380,
     columns: int = 6,
+    key_column: Optional[str] = None,
+    selected: Optional[str] = None,
 ) -> go.Figure:
     """
     Grid heatmap of a single metric (typically % change) across instruments.
 
     Lays values out in a `columns`-wide grid rather than a treemap so cells
     stay equally weighted and comparable at a glance.
+
+    With `key_column`, every tile is clickable: render the figure with
+    `render_chart(..., on_select="rerun")` and read the clicked tile's key back
+    with `selected_customdata`. `selected` outlines the tile with that key.
     """
     if df is None or df.empty or value_column not in df.columns:
         return style_figure(go.Figure(), height=height, title="NO DATA")
@@ -456,6 +462,8 @@ def heatmap(
         for r in range(rows)
     ])
 
+    clickable = bool(key_column) and key_column in data.columns
+
     fig = go.Figure(go.Heatmap(
         z=grid, text=text, texttemplate="%{text}",
         textfont=dict(size=11, family=THEME.font_mono),
@@ -463,12 +471,53 @@ def heatmap(
         showscale=True,
         colorbar=dict(title="%", tickfont=dict(color=THEME.muted, size=9),
                       thickness=11, len=0.75),
-        hoverinfo="text", xgap=2, ygap=2,
+        # When tiles are clickable the invisible markers below own the hover;
+        # a second label from the heatmap would stack on top of it.
+        hoverinfo="skip" if clickable else "text", xgap=2, ygap=2,
     ))
 
     fig.update_xaxes(visible=False)
     fig.update_yaxes(visible=False, autorange="reversed")
-    return style_figure(fig, height=height, title=title, showlegend=False)
+
+    if clickable:
+        keys = ["" if pd.isna(key) else str(key) for key in data[key_column]]
+        keys += [""] * (rows * columns - len(keys))
+        # Plotly cannot select heatmap cells, and Streamlit only reports
+        # selectable points, so each tile carries an invisible marker at its
+        # centre that owns the hover and the click. Every cell gets one -
+        # keyless and padding cells included - so with hoverdistance=-1 a
+        # click anywhere lands on the tile under the cursor: in a rectangular
+        # grid the nearest centre is always the containing cell's.
+        fig.add_trace(go.Scatter(
+            x=[index % columns for index in range(len(keys))],
+            y=[index // columns for index in range(len(keys))],
+            customdata=keys, hovertext=text.flatten().tolist(),
+            hovertemplate="%{hovertext}<extra></extra>",
+            mode="markers", marker=dict(size=48, opacity=0),
+            selected=dict(marker=dict(opacity=0)),
+            unselected=dict(marker=dict(opacity=0)),
+            showlegend=False,
+        ))
+        # Fixed ranges: marker padding would otherwise widen the autorange and
+        # pull the tiles in from the edges, and a tile grid that zooms under
+        # the scroll wheel stops being a grid. No spike lines either - the
+        # crosshair they draw means nothing on a categorical layout.
+        fig.update_xaxes(range=[-0.5, columns - 0.5], autorange=False,
+                         fixedrange=True, showspikes=False)
+        fig.update_yaxes(range=[rows - 0.5, -0.5], autorange=False,
+                         fixedrange=True, showspikes=False)
+
+        if selected and str(selected) in keys:
+            row, col = divmod(keys.index(str(selected)), columns)
+            fig.add_shape(type="rect", x0=col - 0.5, x1=col + 0.5,
+                          y0=row - 0.5, y1=row + 0.5,
+                          line=dict(color=THEME.amber, width=3))
+
+    fig = style_figure(fig, height=height, title=title, showlegend=False)
+    if clickable:
+        fig.update_layout(hovermode="closest", hoverdistance=-1,
+                          clickmode="event+select", dragmode=False)
+    return fig
 
 
 def gauge(
@@ -722,9 +771,45 @@ def status_bar(items: Dict[str, str]) -> None:
     )
 
 
-def render_chart(fig: go.Figure, key: Optional[str] = None) -> None:
-    """st.plotly_chart with the terminal's standard config applied."""
-    st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG, key=key)
+def render_chart(fig: go.Figure, key: Optional[str] = None,
+                 on_select: Any = "ignore") -> Any:
+    """
+    st.plotly_chart with the terminal's standard config applied.
+
+    Pass on_select="rerun" to make points clickable and get the selection
+    event back - read it with `selected_customdata`. The default keeps the
+    chart display-only.
+    """
+    kwargs: Dict[str, Any] = {"use_container_width": True,
+                              "config": PLOTLY_CONFIG, "key": key}
+    if on_select != "ignore":
+        kwargs.update(on_select=on_select, selection_mode="points")
+    return st.plotly_chart(fig, **kwargs)
+
+
+def selected_customdata(event: Any) -> Optional[str]:
+    """
+    The customdata of the first selected point in a chart event, or None.
+
+    Streamlit hands back an attribute dictionary; plain dicts and objects are
+    accepted too, so this is testable without a running app. A 2-D customdata
+    arrives as a one-item list and is unwrapped. An empty string marks a point
+    with nothing behind it - a keyless tile - and reads as no selection.
+    """
+    if not event:
+        return None
+    selection = (event.get("selection") if isinstance(event, dict)
+                 else getattr(event, "selection", None))
+    points = ((selection.get("points") if isinstance(selection, dict)
+               else getattr(selection, "points", None)) or [])
+    for point in points:
+        data = (point.get("customdata") if isinstance(point, dict)
+                else getattr(point, "customdata", None))
+        if isinstance(data, (list, tuple)):
+            data = data[0] if data else None
+        if data not in (None, ""):
+            return str(data)
+    return None
 
 
 # ==========================================================================

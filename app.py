@@ -44,7 +44,7 @@ from data_fetchers import aviation, equities, macro, maritime, news  # noqa: E40
 from data_fetchers import company_intel, portfolio, supply_chain  # noqa: E402
 from data_fetchers import macro_regime  # noqa: E402
 from data_fetchers import fundamentals, social  # noqa: E402
-from data_fetchers import allocation  # noqa: E402
+from data_fetchers import allocation, sectors  # noqa: E402
 from ui import components as ui  # noqa: E402
 from ui import maps  # noqa: E402
 from ui.terminal_theme import THEME, apply_theme  # noqa: E402
@@ -447,6 +447,157 @@ def _home_quotes(symbols: Tuple[str, ...]) -> Dict[str, Dict[str, Any]]:
         return {}
 
 
+# Size floors for the drill-down's cap filter. Round numbers on purpose: this
+# is a coarse "hide the micro-caps" control, not a screener.
+_SECTOR_CAP_FLOORS: Dict[str, Optional[float]] = {
+    "ANY SIZE": None, "$1B+": 1e9, "$10B+": 10e9, "$50B+": 50e9, "$200B+": 200e9,
+}
+
+
+def _render_sector_drilldown(etf: str, quote: Dict[str, Any]) -> None:
+    """
+    The companies inside one heatmap tile, filterable.
+
+    Opened by clicking a sector on the home heatmap and kept in session state
+    until closed, so changing a filter - which reruns the page - does not snap
+    it shut. The list is Yahoo's published constituents, which stop at fifty
+    per industry, so the header states how many companies it lists against how
+    many Yahoo counts, and what share of the sector's value they cover.
+    """
+    label, sector_key = config.SECTOR_ETFS[etf]
+
+    head, close = st.columns([6, 1])
+    with close:
+        if st.button("✕ CLOSE", key="home_sector_close", use_container_width=True):
+            st.session_state.pop("home_sector", None)
+            st.session_state["home_sector_reset"] = (
+                st.session_state.get("home_sector_reset", 0) + 1)
+            st.rerun()
+
+    with st.spinner(f"Reading {label.title()} constituents…"):
+        data = _safe(sectors.get_sector_constituents, sector_key, default={}) or {}
+    name = str(data.get("name") or label).upper()
+    with head:
+        st.markdown(f"### {name} · COMPANIES")
+
+    table = data.get("table")
+    if table is None or table.empty:
+        ui.alert(f"No constituents came back for {name}.", "warn")
+        return
+
+    count = data.get("companies_count")
+    failed = data.get("failed_industries") or []
+    change = quote.get("change_pct")
+    ui.metric_row([
+        ui.metric_tile(f"{etf} TODAY", change, value_format="{:+.2f}%",
+                       subtitle="sector fund, last session",
+                       accent=THEME.green if (change or 0) >= 0 else THEME.red),
+        ui.metric_tile("COMPANIES LISTED", len(table), value_format="{:,.0f}",
+                       subtitle=(f"of {count:,} Yahoo counts" if count
+                                 else "Yahoo count unavailable")),
+        ui.metric_tile("VALUE COVERED", data.get("coverage_pct"),
+                       value_format="{:.1f}%", subtitle="of sector market cap"),
+        ui.metric_tile("INDUSTRIES", data.get("industries"), value_format="{:,.0f}",
+                       subtitle=(f"{len(failed)} did not load" if failed
+                                 else "all loaded"),
+                       accent=THEME.red if failed else THEME.cyan),
+        ui.metric_tile("SECTOR CAP",
+                       equities.format_large_number(data.get("market_cap")),
+                       subtitle="all companies, per Yahoo"),
+    ], columns=5)
+
+    if failed:
+        ui.alert(f"Not loaded this time: {', '.join(failed)}. Their companies "
+                 "are missing from the list below.", "warn")
+
+    # --- Filters -----------------------------------------------------------
+    # Keyed per sector, so switching tiles starts clean instead of applying
+    # one sector's industry picks to another.
+    search_col, industry_col, rating_col, size_col = st.columns([3, 4, 3, 3])
+    with search_col:
+        query = st.text_input("SEARCH", key=f"sector_query_{etf}",
+                              placeholder="ticker or company name")
+    with industry_col:
+        chosen_industries = st.multiselect(
+            "INDUSTRY", sectors.industry_options(table),
+            key=f"sector_industry_{etf}", placeholder="all industries")
+    with rating_col:
+        chosen_ratings = st.multiselect(
+            "ANALYST RATING", sectors.rating_options(table),
+            key=f"sector_rating_{etf}", placeholder="any rating")
+    with size_col:
+        floor = st.selectbox("MIN MKT CAP", list(_SECTOR_CAP_FLOORS),
+                             key=f"sector_cap_{etf}")
+
+    matches = sectors.filter_constituents(
+        table, query=query, industries=chosen_industries,
+        ratings=chosen_ratings, min_market_cap=_SECTOR_CAP_FLOORS[floor])
+    if matches.empty:
+        ui.alert("No company in this sector matches those filters.", "warn")
+        return
+
+    # Prices for the largest matches only - see config.SECTOR_PRICE_LIMIT.
+    limit = config.SECTOR_PRICE_LIMIT
+    with st.spinner("Pricing companies…"):
+        quotes = _safe(equities.get_quotes_batch,
+                       tuple(sorted(matches["ticker"].head(limit))),
+                       default={}) or {}
+    shown = sectors.attach_quotes(matches, quotes)
+
+    note = f"{len(matches):,} of {len(table):,} listed companies match."
+    if len(matches) > limit:
+        note += (f" Prices shown for the {limit} largest - narrow the filter "
+                 "to price the rest.")
+    st.caption(note)
+
+    display = shown.assign(
+        market_cap_b=shown["market_cap"] / 1e9,
+        industry=shown["industry"].fillna("—"),
+    )[["ticker", "name", "industry", "price", "change_pct", "market_cap_b",
+       "sector_weight_pct", "industry_weight_pct", "rating"]].rename(columns={
+        "ticker": "TICKER", "name": "COMPANY", "industry": "INDUSTRY",
+        "price": "LAST", "change_pct": "CHG %", "market_cap_b": "≈ MKT CAP $B",
+        "sector_weight_pct": "SECTOR WT %", "industry_weight_pct": "INDUSTRY WT %",
+        "rating": "RATING",
+    })
+    styler = display.style.format({
+        "LAST": "{:,.2f}", "CHG %": "{:+.2f}", "≈ MKT CAP $B": "{:,.1f}",
+        "SECTOR WT %": "{:.2f}", "INDUSTRY WT %": "{:.1f}",
+    }, na_rep="—").map(
+        lambda value: "" if pd.isna(value) else
+        f"color: {THEME.green if value > 0 else THEME.red if value < 0 else THEME.muted}",
+        subset=["CHG %"])
+
+    event = st.dataframe(
+        styler, use_container_width=True, hide_index=True,
+        height=min(38 + 35 * len(display), 560),
+        on_select="rerun", selection_mode="single-row",
+        key=f"sector_table_{etf}")
+
+    selected_rows = list(getattr(getattr(event, "selection", None), "rows", None) or [])
+    if selected_rows:
+        pick = shown.iloc[selected_rows[0]]
+        open_col, note_col = st.columns([2, 5])
+        with open_col:
+            if st.button(f"OPEN {pick['ticker']} IN EQUITY ▸",
+                         key=f"sector_open_{etf}", use_container_width=True):
+                execute_command(f"{pick['ticker']} EQUITY")
+                st.rerun()
+        with note_col:
+            st.caption(f"{pick['name']} selected.")
+    else:
+        st.caption("Select a row to open that company in EQUITY. Click a column "
+                   "header to sort.")
+
+    st.caption(
+        "Yahoo publishes up to fifty of the largest companies per industry, so "
+        "the smallest names in a sector are not listed - VALUE COVERED says how "
+        "much of the sector that leaves out. SECTOR WT % is a company's published "
+        "share of its industry times the industry's share of the sector; "
+        "≈ MKT CAP is that weight times the sector's total cap, within a few "
+        "percent of the company's own figure.")
+
+
 def page_home() -> None:
     ui.module_header("OPEN-TERMINAL", "MARKET OVERVIEW")
 
@@ -508,30 +659,41 @@ def page_home() -> None:
     left, right = st.columns([3, 2])
 
     # --- Sector heatmap ----------------------------------------------------
+    sector_quotes: Dict[str, Dict[str, Any]] = {}
     with left:
         st.markdown("### SECTOR PERFORMANCE")
-        sector_etfs = {
-            "XLK": "TECH", "XLF": "FINANCIALS", "XLE": "ENERGY",
-            "XLV": "HEALTH", "XLI": "INDUSTRIAL", "XLY": "CONS DISC",
-            "XLP": "CONS STAPLE", "XLU": "UTILITIES", "XLB": "MATERIALS",
-            "XLRE": "REAL ESTATE", "XLC": "COMM SVCS", "SPY": "S&P 500",
-        }
+        picked: Optional[str] = None
         try:
-            sector_quotes = equities.get_quotes_batch(tuple(sector_etfs))
+            sector_quotes = equities.get_quotes_batch(tuple(config.SECTOR_ETFS))
             rows = [
-                {"label": name, "change": sector_quotes[symbol]["change_pct"]}
-                for symbol, name in sector_etfs.items()
+                {"label": label, "change": sector_quotes[symbol]["change_pct"],
+                 "symbol": symbol if sector_key else None}
+                for symbol, (label, sector_key) in config.SECTOR_ETFS.items()
                 if symbol in sector_quotes
             ]
             if rows:
-                ui.render_chart(
+                # Clicking a tile opens its companies below. The key carries a
+                # reset counter because a Plotly selection cannot be cleared
+                # from Python - closing the panel remounts the chart instead.
+                event = ui.render_chart(
                     ui.heatmap(pd.DataFrame(rows), "change", "label",
-                               "DAILY % CHANGE", height=300, columns=4)
+                               "DAILY % CHANGE · CLICK A SECTOR", height=300,
+                               columns=4, key_column="symbol",
+                               selected=st.session_state.get("home_sector")),
+                    key=f"home_sector_heat_{st.session_state.get('home_sector_reset', 0)}",
+                    on_select="rerun",
                 )
+                picked = ui.selected_customdata(event)
             else:
                 ui.alert("Sector data unavailable.", "warn")
         except Exception as exc:
             ui.alert(f"Sector heatmap unavailable: {exc}", "warn")
+
+        # Outside the try: st.rerun works by raising, and a broad except must
+        # not be the thing that catches it.
+        if picked and picked != st.session_state.get("home_sector"):
+            st.session_state["home_sector"] = picked
+            st.rerun()
 
     # --- Macro snapshot ----------------------------------------------------
     with right:
@@ -555,6 +717,13 @@ def page_home() -> None:
                 ui.alert("Yield curve data unavailable.", "warn")
         except Exception as exc:
             ui.alert(f"Curve unavailable: {exc}", "warn")
+
+    # --- Sector drill-down ------------------------------------------------
+    # Full width under the heatmap row, and only after the yield curve has
+    # drawn, so a first-time constituent fetch never holds up the right column.
+    chosen = st.session_state.get("home_sector")
+    if chosen and (config.SECTOR_ETFS.get(chosen) or ("", None))[1]:
+        _render_sector_drilldown(chosen, sector_quotes.get(chosen, {}))
 
     # --- News + chokepoints ------------------------------------------------
     news_col, ship_col = st.columns([3, 2])

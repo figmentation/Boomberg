@@ -24,7 +24,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # --------------------------------------------------------------------------
 # .env loading (optional dependency - never fatal)
@@ -1047,6 +1047,37 @@ YAHOO_TO_GICS: Dict[str, str] = {
     "basicmaterials": "Materials",
     "materials": "Materials",
 }
+
+
+# ==========================================================================
+# SECTOR DRILL-DOWN
+# ==========================================================================
+# The home heatmap's tiles: SPDR sector fund -> (tile label, Yahoo sector
+# key). Both sides are fixed classifications rather than data that drifts -
+# each fund tracks one sector by mandate, and Yahoo's eleven sectors line up
+# one-for-one with GICS through YAHOO_TO_GICS. The keys are Yahoo's URL slugs
+# ("real-estate"); the display names yfinance's own constants carry ("Real
+# Estate") all 404. SPY is the whole market, not a sector, so it has no key.
+SECTOR_ETFS: Dict[str, Tuple[str, Optional[str]]] = {
+    "XLK": ("TECH", "technology"),
+    "XLF": ("FINANCIALS", "financial-services"),
+    "XLE": ("ENERGY", "energy"),
+    "XLV": ("HEALTH", "healthcare"),
+    "XLI": ("INDUSTRIAL", "industrials"),
+    "XLY": ("CONS DISC", "consumer-cyclical"),
+    "XLP": ("CONS STAPLE", "consumer-defensive"),
+    "XLU": ("UTILITIES", "utilities"),
+    "XLB": ("MATERIALS", "basic-materials"),
+    "XLRE": ("REAL ESTATE", "real-estate"),
+    "XLC": ("COMM SVCS", "communication-services"),
+    "SPY": ("S&P 500", None),
+}
+
+# Quotes are fetched for at most this many of the companies a filter leaves,
+# largest first. A batch of a hundred takes about two seconds; a whole
+# industrials list runs to several hundred names, too slow to reprice every
+# time a filter changes. Narrowing the filter prices the rest.
+SECTOR_PRICE_LIMIT: int = 150
 
 
 # Benchmark strategies. Each names a real, liquid fund whose CURRENT sector
