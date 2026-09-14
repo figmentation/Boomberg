@@ -181,9 +181,95 @@ def _quotes(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
         return {}
 
 
+def _listing_currencies(symbols: List[str]) -> Dict[str, Optional[str]]:
+    """
+    Quote currency per symbol, None where it could not be established.
+
+    Cached for a week per listing, so this costs a request the first time a
+    symbol is held and a cache read after that.
+    """
+    unique = sorted(set(symbols))
+    if not unique:
+        return {}
+
+    def lookup(symbol: str) -> Optional[str]:
+        try:
+            return equities.get_quote_currency(symbol)
+        except Exception as exc:
+            log.warning("Quote currency unknown for %s: %s", symbol, exc)
+            return None
+
+    # Same pattern as build_brief: a first visit with a dozen new listings
+    # would otherwise hold the holdings page on a dozen serial lookups.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        return dict(zip(unique, pool.map(lookup, unique)))
+
+
+def _fx_rates(currencies: List[Optional[str]], base: str) -> Dict[str, float]:
+    """Rates into `base`, or only the base itself if the fetch failed."""
+    wanted = tuple(sorted({code for code in currencies if code and code != base}))
+    if not wanted:
+        return {base: 1.0}
+    try:
+        return equities.get_fx_rates(wanted, base)
+    except Exception as exc:
+        log.warning("FX into %s failed for %s: %s", base, ", ".join(wanted), exc)
+        return {base: 1.0}
+
+
+def _valued_mask(frame: pd.DataFrame) -> pd.Series:
+    """
+    Rows that made it into the base-currency totals.
+
+    A native price alone is not enough: an SGX listing with a quote but no SGD
+    rate shows its price and is still absent from every sum.
+    """
+    mask = frame["price"].notna()
+    if "unpriced_reason" in frame.columns:
+        mask &= frame["unpriced_reason"].isna()
+    return mask
+
+
+def fx_applied(valued: pd.DataFrame) -> Dict[str, float]:
+    """
+    The crosses actually used on the valued book, per major currency.
+
+    Excludes the base currency and anything left unpriced, so a caption built
+    from it never cites a rate that did not touch a figure.
+    """
+    if (valued is None or valued.empty or "currency" not in valued.columns
+            or "fx_rate" not in valued.columns):
+        return {}
+    used: Dict[str, float] = {}
+    priced = valued.loc[_valued_mask(valued)]
+    for code, rate in zip(priced["currency"], priced["fx_rate"]):
+        major, units = equities.currency_unit(code if pd.notna(code) else None)
+        if major and major != config.BASE_CURRENCY and pd.notna(rate):
+            used[major] = float(rate) * units
+    return used
+
+
 def value_positions(frame: pd.DataFrame) -> pd.DataFrame:
     """
-    Mark holdings to market.
+    Mark holdings to market in `config.BASE_CURRENCY`.
+
+    Yahoo prices each listing in its exchange's currency - D05.SI in SGD, VOO
+    in USD - and cost basis is entered in that same listing currency, because
+    that is what the broker statement shows. `price` and `cost_basis` stay
+    native so they still match the statement; `day_pnl`, `market_value`,
+    `cost` and `pnl` are converted into the base currency so they can be
+    summed. Adding SGD to USD directly gives a total in no currency at all.
+
+    Both legs of the return are converted at today's rate, so `pnl` is the
+    local-market return translated at today's rate. The currency move since
+    purchase is not in it: the rate on the purchase date was never recorded.
+    `pnl_pct` is a ratio and is unaffected by the conversion.
+
+    A position that cannot be converted is left unpriced, and
+    `unpriced_reason` says why: no quote, no quote currency, or no rate for
+    its currency. Falling back to a rate of 1.0 would be a guess that looks
+    exactly like a figure, and it would flow into every total, weight and
+    sector.
 
     Cost basis is optional: a row with a quantity but no basis still gets a
     market value and a day move, it just cannot show a return. Reporting a
@@ -193,37 +279,64 @@ def value_positions(frame: pd.DataFrame) -> pd.DataFrame:
     if frame is None or frame.empty:
         return pd.DataFrame()
 
+    base = config.BASE_CURRENCY
     quotes = _quotes(list(frame["ticker"]))
+    # Only quoted symbols are worth a currency lookup. A dead symbol has no
+    # price to convert, and asking after its currency adds a failing call to
+    # every page load.
+    currencies = _listing_currencies(
+        [symbol for symbol in frame["ticker"]
+         if quotes.get(symbol, {}).get("price") is not None])
+    rates = _fx_rates([equities.currency_unit(code)[0]
+                       for code in currencies.values()], base)
     rows: List[Dict[str, Any]] = []
 
     for _, holding in frame.iterrows():
         symbol = holding["ticker"]
         quote = quotes.get(symbol, {})
         price = quote.get("price")
+        change = quote.get("change")
         quantity = holding.get("quantity")
         basis = holding.get("cost_basis")
 
-        market_value = (price * quantity
-                        if price is not None and pd.notna(quantity) else None)
-        cost = (basis * quantity
-                if pd.notna(basis) and pd.notna(quantity) else None)
+        currency = currencies.get(symbol)
+        major, units = equities.currency_unit(currency)
+        rate = rates.get(major) if major else None
+
+        if price is None:
+            reason = "no quote"
+        elif currency is None:
+            reason = "no quote currency"
+        elif rate is None:
+            reason = f"no {major} to {base} rate"
+        else:
+            reason = None
+
+        # Base currency per one quote unit, so a pence listing is brought
+        # down to pounds before the GBP cross is applied.
+        fx = rate / units if reason is None else None
+        sized = fx is not None and pd.notna(quantity)
+
+        market_value = price * quantity * fx if sized else None
+        cost = basis * quantity * fx if sized and pd.notna(basis) else None
         pnl = (market_value - cost
                if market_value is not None and cost is not None else None)
-        day_pnl = (quote.get("change") * quantity
-                   if quote.get("change") is not None and pd.notna(quantity)
-                   else None)
+        day_pnl = change * quantity * fx if sized and change is not None else None
 
         rows.append({
             "ticker": symbol,
             "quantity": quantity,
             "cost_basis": basis,
             "price": price,
+            "currency": currency,
+            "fx_rate": fx,
             "change_pct": quote.get("change_pct"),
             "day_pnl": day_pnl,
             "market_value": market_value,
             "cost": cost,
             "pnl": pnl,
             "pnl_pct": (pnl / cost * 100.0) if pnl is not None and cost else None,
+            "unpriced_reason": reason,
             "note": holding.get("note", ""),
         })
 
@@ -236,10 +349,11 @@ def value_positions(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def portfolio_summary(valued: pd.DataFrame) -> Dict[str, Any]:
-    """Headline totals for the metric row."""
+    """Headline totals for the metric row, in `config.BASE_CURRENCY`."""
     if valued is None or valued.empty:
         return {"positions": 0, "market_value": None, "day_pnl": None,
-                "pnl": None, "pnl_pct": None, "priced": 0}
+                "pnl": None, "pnl_pct": None, "priced": 0,
+                "currency": config.BASE_CURRENCY}
 
     market_value = valued["market_value"].sum(skipna=True)
     cost = valued["cost"].sum(skipna=True)
@@ -248,7 +362,8 @@ def portfolio_summary(valued: pd.DataFrame) -> Dict[str, Any]:
 
     return {
         "positions": len(valued),
-        "priced": int(valued["price"].notna().sum()),
+        "priced": int(_valued_mask(valued).sum()),
+        "currency": config.BASE_CURRENCY,
         "market_value": float(market_value) if market_value else None,
         "cost": float(cost) if cost else None,
         "day_pnl": float(day_pnl) if pd.notna(day_pnl) else None,
@@ -433,6 +548,8 @@ def book_snapshot(positions: pd.DataFrame,
 
     totals = portfolio_summary(positions)
     stats = allocation.concentration(positions)
+    priced = _valued_mask(positions)
+    valued, unpriced = positions.loc[priced], positions.loc[~priced]
 
     # portfolio_summary sums with skipna, so a book with no day moves or no
     # cost basis at all totals to 0.0. Zero is a claim; absent is honest.
@@ -446,11 +563,19 @@ def book_snapshot(positions: pd.DataFrame,
 
     limit = config.POSITION_CONCENTRATION_PCT
     weights = positions.dropna(subset=["weight"])
+    reasons = ({str(ticker): str(reason) for ticker, reason
+                in zip(unpriced["ticker"], unpriced["unpriced_reason"])
+                if pd.notna(reason)}
+               if "unpriced_reason" in unpriced.columns else {})
 
     book: Dict[str, Any] = {
         "as_of": sgt_now().isoformat(timespec="seconds"),
+        # Recorded so an archived paragraph keeps the currency it was written
+        # in, and so a book summed before conversion existed can be told apart.
+        "currency": totals.get("currency") or config.BASE_CURRENCY,
+        "fx": fx_applied(positions),
         "positions": len(positions),
-        "priced": int(positions["price"].notna().sum()),
+        "priced": int(priced.sum()),
         "with_basis": int(positions["cost"].notna().sum()),
         "market_value": market_value,
         "day_pnl": day_pnl,
@@ -464,12 +589,14 @@ def book_snapshot(positions: pd.DataFrame,
         "effective_positions": _float_or_none(stats.get("effective_positions")),
         "over_limit": [str(t) for t in
                        weights.loc[weights["weight"] >= limit, "ticker"]],
-        "day_best": _extreme(positions, "change_pct", largest=True),
-        "day_worst": _extreme(positions, "change_pct", largest=False),
-        "return_best": _extreme(positions, "pnl_pct", largest=True),
-        "return_worst": _extreme(positions, "pnl_pct", largest=False),
-        "unpriced": [str(t) for t in
-                     positions.loc[positions["price"].isna(), "ticker"]],
+        # Over the valued book only, so the paragraph never leads with the
+        # move of a position it then says was left out of every figure.
+        "day_best": _extreme(valued, "change_pct", largest=True),
+        "day_worst": _extreme(valued, "change_pct", largest=False),
+        "return_best": _extreme(valued, "pnl_pct", largest=True),
+        "return_worst": _extreme(valued, "pnl_pct", largest=False),
+        "unpriced": [str(t) for t in unpriced["ticker"]],
+        "unpriced_reasons": reasons,
         "sectors": [],
         "unclassified_pct": None,
     }
@@ -486,8 +613,9 @@ def book_snapshot(positions: pd.DataFrame,
     return book
 
 
-def _money(value: float) -> str:
-    return f"${abs(value):,.0f}"
+def _money(value: float, currency: Optional[str] = None) -> str:
+    prefix = equities.currency_prefix(currency or config.BASE_CURRENCY)
+    return f"{prefix}{abs(value):,.0f}"
 
 
 def _join(items: List[str]) -> str:
@@ -505,6 +633,10 @@ def compose_narrative(book: Optional[Dict[str, Any]],
     Every clause is conditional on the figure behind it existing. A sentence
     that says "0.0% above cost" for a book with no cost basis entered reads
     exactly like a real result, so a missing input drops the clause instead.
+
+    Money is written in the currency the book was converted into, and the
+    rates applied are named: a total for a book holding SGX listings only
+    means something once it says what the SGD was converted at.
     """
     if not book or not book.get("positions"):
         return ""
@@ -515,23 +647,33 @@ def compose_narrative(book: Optional[Dict[str, Any]],
     count = book["positions"]
     noun = "position" if count == 1 else "positions"
     priced = book.get("priced", 0)
+    currency = book.get("currency") or config.BASE_CURRENCY
+    reasons = book.get("unpriced_reasons") or {}
 
     # --- Value and P&L ----------------------------------------------------
     value = book.get("market_value")
     if value is None:
-        sentences.append(f"None of your {count} {noun} returned a quote, so "
-                         "the book cannot be valued this edition.")
+        # A book that could not be converted did return quotes. Saying it did
+        # not sends the reader off to re-check symbols that are fine.
+        if set(reasons.values()) - {"no quote"}:
+            sentences.append(
+                f"None of your {count} {noun} could be valued in {currency} "
+                f"this edition ({'; '.join(sorted(set(reasons.values())))}).")
+        else:
+            sentences.append(f"None of your {count} {noun} returned a quote, "
+                             "so the book cannot be valued this edition.")
     else:
-        text = f"Your book of {count} {noun} is worth {_money(value)}"
+        text = (f"Your book of {count} {noun} is worth "
+                f"{_money(value, currency)}")
         day = book.get("day_pnl")
         if day is not None:
-            text += f", {'up' if day >= 0 else 'down'} {_money(day)}"
+            text += f", {'up' if day >= 0 else 'down'} {_money(day, currency)}"
             if book.get("day_pct") is not None:
                 text += f" ({book['day_pct']:+.2f}%)"
             text += " on the last session"
         pnl = book.get("pnl")
         if pnl is not None:
-            text += f", and sits {_money(pnl)}"
+            text += f", and sits {_money(pnl, currency)}"
             if book.get("pnl_pct") is not None:
                 text += f" ({book['pnl_pct']:+.1f}%)"
             text += f" {'above' if pnl >= 0 else 'below'} cost"
@@ -540,6 +682,12 @@ def compose_narrative(book: Optional[Dict[str, Any]],
                 text += (f" on the {with_basis} of {priced} priced positions "
                          "with a cost basis entered")
         sentences.append(text + ".")
+
+        fx = book.get("fx") or {}
+        if fx:
+            crosses = [f"{code} at {rate:.4f}" for code, rate in sorted(fx.items())]
+            sentences.append(
+                f"Figures are in {currency}, converting {_join(crosses)}.")
 
     # --- Concentration ----------------------------------------------------
     largest = book.get("largest_ticker")
@@ -617,12 +765,20 @@ def compose_narrative(book: Optional[Dict[str, Any]],
         sentences.append(text + ".")
 
     # --- Gaps -------------------------------------------------------------
+    # Grouped by what was missing, since "no quote" and "no SGD to USD rate"
+    # call for different fixes. Books stored before reasons were recorded
+    # only ever had the first.
     unpriced = book.get("unpriced") or []
     if unpriced and value is not None:
-        sentences.append(
-            f"No quote came back for {_join(unpriced)}, so "
-            f"{'it is' if len(unpriced) == 1 else 'they are'} left out of "
-            "every figure above.")
+        groups: Dict[str, List[str]] = {}
+        for ticker in unpriced:
+            groups.setdefault(reasons.get(ticker, "no quote"), []).append(ticker)
+        for reason, tickers in groups.items():
+            sentences.append(
+                f"{reason[0].upper()}{reason[1:]} came back for "
+                f"{_join(tickers)}, so "
+                f"{'it is' if len(tickers) == 1 else 'they are'} left out of "
+                "every figure above.")
 
     return " ".join(sentences)
 
@@ -729,7 +885,9 @@ def get_brief(force: bool = False) -> Dict[str, Any]:
 
     An edition written before the book summary existed gets one added rather
     than being rebuilt: the headlines are the expensive half, and they are
-    already on disk.
+    already on disk. So does one whose summary has no currency recorded -
+    that book was summed before listings were converted, and its paragraph
+    printed SGD and USD added together behind a "$".
     """
     edition = edition_date()
     path = _brief_path(edition)
@@ -740,7 +898,8 @@ def get_brief(force: bool = False) -> Dict[str, Any]:
         except Exception as exc:
             log.warning("Brief %s unreadable, rebuilding: %s", edition, exc)
         else:
-            if "book" not in brief and not brief.get("empty"):
+            if (not brief.get("empty")
+                    and "currency" not in (brief.get("book") or {})):
                 positions = value_positions(holdings())
                 brief["book"] = book_snapshot(positions, _sector_mix(positions))
                 brief["narrative"] = compose_narrative(
@@ -768,7 +927,7 @@ def load_edition(edition: date) -> Optional[Dict[str, Any]]:
 __all__ = [
     "SGT", "HOLDING_COLUMNS", "WATCHLIST_COLUMNS",
     "load", "save", "holdings", "watchlist", "add_to_watchlist",
-    "value_positions", "portfolio_summary", "watchlist_quotes",
+    "value_positions", "portfolio_summary", "fx_applied", "watchlist_quotes",
     "sgt_now", "edition_date", "next_edition_at", "stored_editions",
     "build_brief", "get_brief", "load_edition",
     "MOOD_THRESHOLD", "mood_label", "book_snapshot", "compose_narrative",

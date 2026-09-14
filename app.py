@@ -3126,6 +3126,7 @@ def _render_allocation(valued: pd.DataFrame) -> None:
         return
 
     benchmark = report["benchmark"]
+    money = equities.currency_prefix(config.BASE_CURRENCY)
     st.caption(
         f"{benchmark.get('label', benchmark_key)} — {benchmark.get('description', '')} "
         f"Target weights are {benchmark.get('proxy')}'s current published "
@@ -3147,7 +3148,7 @@ def _render_allocation(valued: pd.DataFrame) -> None:
 
     ui.metric_row([
         ui.metric_tile("BOOK VALUE", report.get("total_value"),
-                       subtitle="$ priced", value_format="{:,.0f}"),
+                       subtitle=f"{config.BASE_CURRENCY} priced", value_format="{:,.0f}"),
         ui.metric_tile("SECTORS HELD", int(
             (exposure["sector"] != allocation.UNCLASSIFIED).sum()),
                        subtitle=f"of {len(config.GICS_SECTORS)} GICS",
@@ -3182,14 +3183,14 @@ def _render_allocation(valued: pd.DataFrame) -> None:
     if report.get("unclassified"):
         for item in report["unclassified"]:
             ui.alert(
-                f"{item['ticker']} (${item['market_value']:,.0f}) could not be "
+                f"{item['ticker']} ({money}{item['market_value']:,.0f}) could not be "
                 f"placed in a sector: {item['reason']} It is excluded from the "
                 "drift maths rather than spread across sectors.", "warn")
 
     # --- Allocation vs benchmark -----------------------------------------
     chart = exposure.copy()
     chart["bar_label"] = [
-        f"{w:.1f}%   ${v:,.0f}"
+        f"{w:.1f}%   {money}{v:,.0f}"
         for w, v in zip(chart["weight_pct"], chart["market_value"])]
 
     left, right = st.columns([1, 1])
@@ -3198,7 +3199,7 @@ def _render_allocation(valued: pd.DataFrame) -> None:
             ui.donut(chart, "sector", "market_value",
                      title="SECTOR SPREAD",
                      height=int(min(max(150 + 32 * len(chart), 300), 700)),
-                     center_value=f"${report.get('total_value', 0):,.0f}",
+                     center_value=f"{money}{report.get('total_value', 0):,.0f}",
                      center_label="book value"),
             key="alloc_donut")
 
@@ -3232,7 +3233,7 @@ def _render_allocation(valued: pd.DataFrame) -> None:
                 f'<span style="color:{colour};font-size:12px;letter-spacing:0.08em;">'
                 f'{action["action"]} · {action["sector"]}</span>'
                 f'<span style="float:right;color:{THEME.amber};font-size:12px;">'
-                f'${action["amount"]:,.0f}</span><br>'
+                f'{money}{action["amount"]:,.0f}</span><br>'
                 f'<span style="color:{THEME.muted};font-size:10px;">'
                 f'{html.escape(action["detail"])}</span></div>',
                 unsafe_allow_html=True)
@@ -3308,6 +3309,7 @@ def _render_position_weights(valued: pd.DataFrame) -> None:
     weights = valued.dropna(subset=["weight"])
     if weights.empty:
         return
+    money = equities.currency_prefix(config.BASE_CURRENCY)
 
     stats = allocation.concentration(valued)
 
@@ -3333,7 +3335,7 @@ def _render_position_weights(valued: pd.DataFrame) -> None:
 
     chart = weights[["ticker", "weight", "market_value"]].copy()
     chart["bar_label"] = [
-        f"{w:.1f}%   ${v:,.0f}" if pd.notna(v) else f"{w:.1f}%"
+        f"{w:.1f}%   {money}{v:,.0f}" if pd.notna(v) else f"{w:.1f}%"
         for w, v in zip(chart["weight"], chart["market_value"])]
 
     # Bars and donut answer different questions and are both worth having:
@@ -3353,7 +3355,7 @@ def _render_position_weights(valued: pd.DataFrame) -> None:
         ui.render_chart(
             ui.donut(chart, "ticker", "market_value", title="POSITION SPREAD",
                      height=int(min(max(150 + 34 * len(chart), 260), 900)),
-                     center_value=f"${total:,.0f}",
+                     center_value=f"{money}{total:,.0f}",
                      center_label="priced book",
                      # Past a dozen names the slivers stop being readable and
                      # start being decoration.
@@ -3387,15 +3389,17 @@ def page_portfolio() -> None:
 
     day_pnl = summary.get("day_pnl")
     total_pnl = summary.get("pnl")
+    base = summary.get("currency") or config.BASE_CURRENCY
+    money = equities.currency_prefix(base)
 
     ui.metric_row([
         ui.metric_tile("MARKET VALUE", summary.get("market_value"),
-                       value_format="${:,.0f}",
-                       subtitle=f"{summary.get('positions', 0)} positions"),
-        ui.metric_tile("DAY P&L", day_pnl, value_format="${:+,.0f}",
+                       value_format=f"{money}{{:,.0f}}",
+                       subtitle=f"{summary.get('positions', 0)} positions · {base}"),
+        ui.metric_tile("DAY P&L", day_pnl, value_format=f"{money}{{:+,.0f}}",
                        subtitle="since previous close",
                        accent=THEME.green if (day_pnl or 0) >= 0 else THEME.red),
-        ui.metric_tile("TOTAL P&L", total_pnl, value_format="${:+,.0f}",
+        ui.metric_tile("TOTAL P&L", total_pnl, value_format=f"{money}{{:+,.0f}}",
                        subtitle=(f"{summary['pnl_pct']:+,.1f}% on cost"
                                  if summary.get("pnl_pct") is not None
                                  else "no cost basis"),
@@ -3443,25 +3447,49 @@ def page_portfolio() -> None:
         if valued.empty:
             ui.alert("No positions yet. Add a row above and save.", "warn")
         else:
+            # BASIS and LAST stay in the listing's own currency so they match
+            # the broker statement; every column that gets summed is in base.
             display = valued[[
-                "ticker", "quantity", "cost_basis", "price", "change_pct",
-                "day_pnl", "market_value", "cost", "pnl", "pnl_pct", "weight",
+                "ticker", "quantity", "currency", "cost_basis", "price",
+                "change_pct", "day_pnl", "market_value", "cost", "pnl",
+                "pnl_pct", "weight",
             ]].rename(columns={
-                "ticker": "TICKER", "quantity": "QTY", "cost_basis": "BASIS",
-                "price": "LAST", "change_pct": "CHG %", "day_pnl": "DAY P&L",
-                "market_value": "MKT VALUE", "cost": "COST", "pnl": "P&L",
+                "ticker": "TICKER", "quantity": "QTY", "currency": "CCY",
+                "cost_basis": "BASIS", "price": "LAST", "change_pct": "CHG %",
+                "day_pnl": f"DAY P&L {base}", "market_value": f"MKT VALUE {base}",
+                "cost": f"COST {base}", "pnl": f"P&L {base}",
                 "pnl_pct": "P&L %", "weight": "WEIGHT %",
             })
             ui.styled_table(
                 display,
-                highlight_columns=["CHG %", "DAY P&L", "P&L", "P&L %"],
+                highlight_columns=["CHG %", f"DAY P&L {base}", f"P&L {base}",
+                                   "P&L %"],
             )
 
-            unpriced = int(valued["price"].isna().sum())
-            if unpriced:
-                ui.alert(
-                    f"{unpriced} position(s) returned no quote — check the "
-                    "symbol is the one Yahoo lists.", "warn")
+            crosses = portfolio.fx_applied(valued)
+            if crosses:
+                st.caption(
+                    "BASIS and LAST are in each listing's own currency (CCY). "
+                    f"Day P&L, value, cost and P&L are in {base}, converting "
+                    + ", ".join(f"{code} at {rate:,.4f}"
+                                for code, rate in sorted(crosses.items()))
+                    + ". Both legs of P&L use today's rate, so it is the "
+                    "local-market return and leaves out currency moves since "
+                    "purchase."
+                )
+
+            unpriced = valued[valued["unpriced_reason"].notna()]
+            for reason, group in unpriced.groupby("unpriced_reason", sort=False):
+                names = ", ".join(group["ticker"])
+                if reason == "no quote":
+                    ui.alert(
+                        f"{names} returned no quote — check the symbol is the "
+                        "one Yahoo lists.", "warn")
+                else:
+                    ui.alert(
+                        f"{names}: {reason}, so left out of every total, weight "
+                        "and sector rather than converted at a guessed rate.",
+                        "warn")
 
             _render_position_weights(valued)
 

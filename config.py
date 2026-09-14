@@ -94,6 +94,8 @@ class CacheTTL:
     aviation: int = 30        # OpenSky state vectors (they update ~5-10s)
     macro: int = 43200        # FRED series (most are monthly/daily releases)
     news: int = 600           # RSS / GDELT
+    fx: int = 900             # FX crosses used to convert the book
+    listing: int = 604800     # A listing's quote currency (7d - it never moves)
 
 
 TTL = CacheTTL()
@@ -107,6 +109,19 @@ TTL = CacheTTL()
 BRIEF_HOUR: int = 8
 BRIEF_MAX_SYMBOLS: int = 25       # positions to research per edition
 BRIEF_STORIES_PER_POSITION: int = 4
+
+
+# ==========================================================================
+# PORTFOLIO CURRENCY
+# ==========================================================================
+# Yahoo quotes a listing in its exchange's currency - D05.SI in SGD, VOO in
+# USD - and cost basis is entered in that same listing currency. A book that
+# spans exchanges has no currency of its own until one is chosen, and adding
+# SGD figures straight onto USD ones produces a total in no currency at all.
+# Every market value, cost and P&L is converted into this before it is
+# summed. Override with OPENTERM_BASE_CURRENCY=SGD in .env.
+BASE_CURRENCY: str = (os.getenv("OPENTERM_BASE_CURRENCY", "USD").strip().upper()
+                      or "USD")
 
 
 # ==========================================================================

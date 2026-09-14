@@ -233,6 +233,121 @@ def get_quotes_batch(tickers: Tuple[str, ...]) -> Dict[str, Dict[str, Any]]:
 
 
 # ==========================================================================
+# CURRENCY
+# ==========================================================================
+# Yahoo quotes a few exchanges in the minor unit: London in pence ("GBp" -
+# the lower-case p is the only thing separating it from "GBP"), Johannesburg
+# in cents, Tel Aviv in agorot. A price of 250 there is 2.50 in the major
+# currency, and converting it as 250 overstates the position a hundredfold.
+_MINOR_UNITS: Dict[str, Tuple[str, float]] = {
+    "GBp": ("GBP", 100.0),
+    "GBX": ("GBP", 100.0),
+    "ZAc": ("ZAR", 100.0),
+    "ZAC": ("ZAR", 100.0),
+    "ILA": ("ILS", 100.0),
+}
+
+# Prefixes for money in tiles and prose. Anything not listed is written as
+# its ISO code, which is unambiguous if less pretty than a symbol.
+_CURRENCY_PREFIX: Dict[str, str] = {
+    "USD": "$", "SGD": "S$", "HKD": "HK$", "AUD": "A$", "CAD": "C$",
+    "NZD": "NZ$",
+}
+
+
+def currency_unit(code: Optional[str]) -> Tuple[Optional[str], float]:
+    """
+    The major currency a quote is in, and how many quote units make one.
+
+    'GBp' -> ('GBP', 100.0), 'SGD' -> ('SGD', 1.0). The minor-unit table is
+    matched before anything is upper-cased, because upper-casing 'GBp' turns
+    pence into pounds. Unknown or empty codes return (None, 1.0).
+    """
+    text = str(code or "").strip()
+    if not text:
+        return None, 1.0
+    if text in _MINOR_UNITS:
+        return _MINOR_UNITS[text]
+    return text.upper(), 1.0
+
+
+def currency_prefix(code: Optional[str]) -> str:
+    """'USD' -> '$', 'SGD' -> 'S$', 'EUR' -> 'EUR '."""
+    major = str(code or "").strip().upper()
+    return _CURRENCY_PREFIX.get(major, f"{major} " if major else "")
+
+
+@cached(ttl=config.TTL.listing, namespace="equity_currency")
+@throttled("yfinance")
+@retry_with_backoff()
+def get_quote_currency(ticker: str) -> str:
+    """
+    The currency Yahoo quotes a listing in: 'USD' for VOO, 'SGD' for D05.SI,
+    'GBp' for a London line.
+
+    This is `currency`, not `financialCurrency`. PDD trades in USD on Nasdaq
+    but reports in CNY; the price is what gets multiplied by a quantity, so
+    the price's currency is the one that matters.
+
+    `fast_info` answers from lightweight chart metadata; the company-info
+    whitelist is the fallback. Raises rather than returning a default when
+    neither knows - "probably USD" must not be cached for a week, and
+    `@cached` serves the last known answer when there is one.
+    """
+    if not YFINANCE_AVAILABLE:
+        raise RuntimeError("yfinance unavailable")
+
+    symbol = normalize_ticker(ticker)
+    code = None
+    try:
+        code = yf.Ticker(symbol).fast_info.currency
+    except Exception as exc:
+        log.debug("fast_info currency failed for %s: %s", symbol, exc)
+
+    if not code:
+        code = (get_company_info(symbol) or {}).get("currency")
+
+    if not code:
+        raise ValueError(f"No quote currency for {symbol}")
+    return str(code).strip()
+
+
+@cached(ttl=config.TTL.fx, namespace="fx_rates")
+def get_fx_rates(currencies: Tuple[str, ...], base: str = "USD") -> Dict[str, float]:
+    """
+    Units of `base` per one unit of each currency: {'USD': 1.0, 'SGD': 0.788}.
+
+    Read off Yahoo's `{CCY}{BASE}=X` crosses in one batch round trip; the base
+    itself maps to 1.0 without a request. A currency whose cross returns
+    nothing is left out of the result, not filled in - a guessed rate puts a
+    wrong number into every total, and the caller can say what is missing.
+
+    Args:
+        currencies: Major ISO codes. Tuple, so the cache key is hashable.
+        base:       The currency to convert into.
+
+    Raises when no requested cross came back at all, so `@cached` serves the
+    last good rates instead of caching an empty answer for the whole TTL.
+    """
+    base = str(base).strip().upper()
+    rates: Dict[str, float] = {base: 1.0}
+    wanted = sorted({str(code).strip().upper() for code in currencies if code})
+    pairs = {code: f"{code}{base}=X" for code in wanted if code != base}
+    if not pairs:
+        return rates
+
+    quotes = get_quotes_batch(tuple(sorted(pairs.values())))
+    for code, pair in pairs.items():
+        price = _safe_float((quotes.get(pair) or {}).get("price"))
+        if price is not None and price > 0:
+            rates[code] = price
+
+    if len(rates) == 1:
+        raise ValueError(f"No FX rates returned for {', '.join(pairs.values())}")
+    return rates
+
+
+# ==========================================================================
 # TECHNICAL INDICATORS
 # ==========================================================================
 def ema(series: pd.Series, span: int) -> pd.Series:
@@ -1283,6 +1398,7 @@ def format_large_number(value: Optional[float], currency: str = "$") -> str:
 
 __all__ = [
     "get_history", "get_quote", "get_quotes_batch",
+    "get_quote_currency", "get_fx_rates", "currency_unit", "currency_prefix",
     "add_indicators", "summarize_technicals",
     "ema", "sma", "rsi", "macd", "bollinger", "atr", "vwap",
     "get_company_info", "get_financial_statements",

@@ -295,8 +295,8 @@ def rebalance(valued: pd.DataFrame,
         "actions": [],
         "disclaimer": (
             "Arithmetic difference between two weight vectors, converted to "
-            "dollars. No view on tax, transaction costs, or whether this "
-            "benchmark suits you. Not advice."
+            f"{config.BASE_CURRENCY}. No view on tax, transaction costs, or "
+            "whether this benchmark suits you. Not advice."
         ),
     }
 
@@ -352,6 +352,10 @@ def _actions(frame: pd.DataFrame, valued: pd.DataFrame) -> List[Dict[str, Any]]:
     """
     threshold = config.REBALANCE_MIN_DRIFT_PCT
     actions: List[Dict[str, Any]] = []
+    # Amounts are in the book's base currency - value_positions converted
+    # every listing before anything reached here. The "Adjust $" column keeps
+    # its name as a key; the prose uses the real currency.
+    money = equities.currency_prefix(config.BASE_CURRENCY)
 
     holders = _sector_holders(valued)
 
@@ -371,8 +375,8 @@ def _actions(frame: pd.DataFrame, valued: pd.DataFrame) -> List[Dict[str, Any]]:
                 "detail": (
                     f"Overweight by {drift:.1f}pp "
                     f"({row['Current %']:.1f}% held vs {row['Target %']:.1f}% "
-                    f"target). Reducing by ${abs(row['Adjust $']):,.0f} would "
-                    f"align it."
+                    f"target). Reducing by {money}{abs(row['Adjust $']):,.0f} "
+                    f"would align it."
                     + (f" Held via {', '.join(names)}." if names else "")),
             })
         elif row["Current %"] == 0:
@@ -383,8 +387,8 @@ def _actions(frame: pd.DataFrame, valued: pd.DataFrame) -> List[Dict[str, Any]]:
                 "amount": abs(row["Adjust $"]),
                 "detail": (
                     f"No exposure at all against a {row['Target %']:.1f}% "
-                    f"benchmark weight. ${abs(row['Adjust $']):,.0f} would "
-                    "bring it to target."),
+                    f"benchmark weight. {money}{abs(row['Adjust $']):,.0f} "
+                    "would bring it to target."),
             })
         else:
             actions.append({
@@ -395,7 +399,7 @@ def _actions(frame: pd.DataFrame, valued: pd.DataFrame) -> List[Dict[str, Any]]:
                 "detail": (
                     f"Underweight by {abs(drift):.1f}pp "
                     f"({row['Current %']:.1f}% held vs {row['Target %']:.1f}% "
-                    f"target). Adding ${abs(row['Adjust $']):,.0f} would "
+                    f"target). Adding {money}{abs(row['Adjust $']):,.0f} would "
                     "align it."),
             })
 
@@ -462,7 +466,8 @@ def concentration(valued: pd.DataFrame) -> Dict[str, Any]:
     unpriced = int(valued["market_value"].isna().sum())
     if unpriced:
         out["flags"].append(
-            f"{unpriced} position(s) have no price, so they are absent from "
+            f"{unpriced} position(s) have no price in {config.BASE_CURRENCY} "
+            "(no quote, or no rate to convert it), so they are absent from "
             "these weights entirely - the percentages describe the priced "
             "book only.")
 
