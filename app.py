@@ -1703,7 +1703,7 @@ def page_aviation() -> None:
 
     # ---- LIVE TRAFFIC ----------------------------------------------------
     with tabs[0]:
-        col_a, col_b, col_c = st.columns([2, 1, 1])
+        col_a, col_b = st.columns([3, 1])
         with col_a:
             region = st.selectbox(
                 "REGION", list(config.AVIATION_REGIONS),
@@ -1713,10 +1713,6 @@ def page_aviation() -> None:
             )
             st.session_state["aviation_region"] = region
         with col_b:
-            color_by = st.selectbox("COLOUR BY",
-                                    ["altitude_ft", "speed_kts", "none"],
-                                    key="av_color")
-        with col_c:
             st.write("")
             refresh = st.button("REFRESH", use_container_width=True)
 
@@ -1763,10 +1759,7 @@ def page_aviation() -> None:
                         "error",
                     )
 
-            ui.render_chart(maps.flight_map(
-                states, f"LIVE TRAFFIC — {region}",
-                color_by=None if color_by == "none" else color_by,
-            ))
+            ui.render_chart(maps.flight_map(states, f"LIVE TRAFFIC — {region}"))
 
             left, right = st.columns(2)
             with left:

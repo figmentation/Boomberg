@@ -299,11 +299,19 @@ def chokepoint_overview_map(statuses: List[Dict[str, Any]]) -> Optional[Any]:
 # ==========================================================================
 # PLOTLY: AIRCRAFT
 # ==========================================================================
+# Every aircraft on the live traffic map is drawn in this one light blue.
+# They used to sit on AMBER_SCALE, whose low end is #1A1A1A: on the
+# carto-darkmatter basemap anything low or slow - every parked aircraft -
+# was near-black and effectively invisible. Light blue reads against the
+# dark map and stays distinct from the cyan used for data text and from
+# the amber of vessels and flight tracks.
+AIRCRAFT_COLOR = "#7DD3FC"
+
+
 def flight_map(
     df: pd.DataFrame,
     title: str = "LIVE AIRCRAFT",
     height: int = 640,
-    color_by: str = "altitude_ft",
     show_labels: bool = False,
 ) -> go.Figure:
     """
@@ -311,11 +319,8 @@ def flight_map(
 
     Plotly rather than Folium here because a global OpenSky query returns
     5-10k aircraft and Leaflet's per-marker DOM nodes make that unusable.
-    Markers are heading-rotated triangles via the `angle` property.
-
-    Args:
-        color_by: Column driving the colour scale - "altitude_ft",
-                  "speed_kts", or "" for a flat amber.
+    Every aircraft is a circle in AIRCRAFT_COLOR; callsign, altitude, speed
+    and heading are in its hover card.
     """
     fig = go.Figure()
 
@@ -333,29 +338,17 @@ def flight_map(
 
     hover = data.apply(_flight_hover, axis=1)
 
+    # Circles, not heading-rotated triangles. On a map trace any symbol other
+    # than "circle" is drawn from the basemap style's icon sprite and ignores
+    # marker.color - carto-darkmatter's triangles render black whatever colour
+    # is set, which is why aircraft were near-invisible. Heading is in the
+    # hover card instead.
     marker: Dict[str, Any] = {
-        "size": 8,
-        "symbol": "triangle",
-        "angle": data["true_track"].fillna(0).tolist(),
+        "size": 7,
+        "symbol": "circle",
         "allowoverlap": True,
+        "color": AIRCRAFT_COLOR,
     }
-
-    if color_by and color_by in data.columns and data[color_by].notna().any():
-        marker.update({
-            "color": data[color_by].fillna(0),
-            "colorscale": AMBER_SCALE,
-            "showscale": True,
-            "colorbar": dict(
-                title=dict(text=color_by.replace("_", " ").upper(),
-                           font=dict(color=THEME.muted, size=9)),
-                tickfont=dict(color=THEME.muted, size=9),
-                thickness=11, len=0.62, x=1.0,
-            ),
-            "cmin": float(data[color_by].quantile(0.02)),
-            "cmax": float(data[color_by].quantile(0.98)),
-        })
-    else:
-        marker["color"] = THEME.amber
 
     fig.add_trace(go.Scattermap(
         lat=data["latitude"], lon=data["longitude"],
