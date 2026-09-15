@@ -468,6 +468,9 @@ def vessel_map_plotly(
     """
     Plotly vessel scatter - the fallback when folium/streamlit-folium aren't
     installed, and the better option above ~800 vessels.
+
+    Each vessel is a circle in its ship-type colour (VESSEL_COLORS); course
+    and heading are in its hover card.
     """
     fig = go.Figure()
 
@@ -481,14 +484,15 @@ def vessel_map_plotly(
         data = df.dropna(subset=["latitude", "longitude"]).copy()
         colors = data.get("ship_type", pd.Series([""] * len(data))).map(_vessel_color)
 
+        # Circles, not heading-rotated triangles. On a map trace any symbol
+        # other than "circle" is drawn from the basemap style's icon sprite and
+        # ignores marker.color, so every vessel rendered black whatever its
+        # type - the same failure flight_map had. Heading is in the hover card.
         fig.add_trace(go.Scattermap(
             lat=data["latitude"], lon=data["longitude"],
             mode="markers",
             marker=dict(
-                size=8, color=colors.tolist(), symbol="triangle",
-                angle=data.get("heading_deg",
-                               data.get("cog_deg", pd.Series(0, index=data.index))
-                               ).fillna(0).tolist(),
+                size=8, color=colors.tolist(), symbol="circle",
                 allowoverlap=True,
             ),
             hovertext=data.apply(_vessel_hover, axis=1),
@@ -527,6 +531,7 @@ def _vessel_hover(row: pd.Series) -> str:
         ("Status", "nav_status", "{}"),
         ("Speed", "sog_kts", "{:.1f} kts"),
         ("Course", "cog_deg", "{:.0f}°"),
+        ("Heading", "heading_deg", "{:.0f}°"),
         ("Draught", "draught_m", "{:.1f} m"),
         ("Destination", "destination", "{}"),
     ):

@@ -1,13 +1,21 @@
 """
-Aircraft markers on the live traffic map.
+Aircraft and vessel markers on the Plotly maps.
 
 REGRESSION CONTEXT
 ------------------
-Aircraft were coloured on the amber intensity scale, whose low end is
-#1A1A1A - near-black on the carto-darkmatter basemap. Anything low or slow,
-which includes every aircraft on the ground, was effectively invisible, and
-the legend swatch rendered black. Every aircraft is now drawn in one light
-blue that reads against the dark map.
+On a Plotly map trace, marker.color only applies to the "circle" symbol.
+Any other symbol is an icon from the basemap style's sprite, so the
+heading-rotated triangles both maps used rendered black on carto-darkmatter
+whatever colour was set:
+
+  * Aircraft also sat on the amber intensity scale, whose low end is
+    #1A1A1A - even with the colour applied, anything low or slow would have
+    been near-black. Every aircraft is now one light blue.
+
+  * Vessels were coloured by ship type (tankers amber, cargo cyan, passenger
+    magenta), and every one of them drew black anyway.
+
+Both maps now use circles, with heading moved into the hover card.
 """
 
 from __future__ import annotations
@@ -86,3 +94,51 @@ class TestFlightMapMarkers:
     def test_empty_frame_renders_a_notice_not_a_crash(self):
         figure = maps.flight_map(pd.DataFrame())
         assert not [trace for trace in figure.data if trace.name == "Aircraft"]
+
+
+def _vessels():
+    """A frame shaped like the maritime module's AIS vessel output."""
+    return pd.DataFrame({
+        "mmsi": [111, 222, 333, 444],
+        "name": ["GULF TANKER", "BOX CARRIER", "RED SEA FERRY", ""],
+        "latitude": [30.00, 30.10, 30.20, 30.30],
+        "longitude": [32.50, 32.55, 32.60, 32.65],
+        "ship_type": ["Tanker", "Cargo", "Passenger", None],
+        "heading_deg": [10.0, 200.0, None, 90.0],
+        "cog_deg": [12.0, 198.0, 45.0, 88.0],
+        "sog_kts": [11.0, 14.5, 18.0, 0.0],
+    })
+
+
+def _vessel_trace(figure):
+    return next(trace for trace in figure.data if trace.name == "Vessels")
+
+
+class TestVesselMapMarkers:
+    def test_markers_are_circles_so_type_colours_apply(self):
+        marker = _vessel_trace(maps.vessel_map_plotly(_vessels())).marker
+        assert marker.symbol == "circle"
+        assert marker.angle is None
+
+    def test_each_vessel_keeps_its_ship_type_colour(self):
+        from config import THEME
+
+        marker = _vessel_trace(maps.vessel_map_plotly(_vessels())).marker
+        assert list(marker.color) == [THEME.amber, THEME.cyan, THEME.magenta,
+                                      THEME.muted]
+
+    def test_heading_and_course_are_in_the_hover_card(self):
+        hover = list(_vessel_trace(maps.vessel_map_plotly(_vessels())).hovertext)
+        assert "Heading: 10°" in hover[0]
+        assert "Course: 12°" in hover[0]
+        # No heading reported: the line is left out rather than shown as 0°.
+        assert "Heading" not in hover[2]
+
+    def test_corridor_outline_is_still_drawn(self):
+        figure = maps.vessel_map_plotly(_vessels(), bbox=(29.9, 32.3, 30.5, 32.9))
+        corridor = next(trace for trace in figure.data if trace.name == "Corridor")
+        assert corridor.mode == "lines"
+
+    def test_empty_frame_renders_a_notice_not_a_crash(self):
+        figure = maps.vessel_map_plotly(pd.DataFrame())
+        assert not [trace for trace in figure.data if trace.name == "Vessels"]
