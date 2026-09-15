@@ -11,6 +11,7 @@ from __future__ import annotations
 import html
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlsplit
 
 import numpy as np
 import pandas as pd
@@ -575,6 +576,34 @@ def gauge(
 
 
 # ==========================================================================
+# LINKS
+# ==========================================================================
+_SAFE_LINK_SCHEMES = frozenset({"http", "https"})
+
+
+def safe_url(url: Any) -> str:
+    """
+    `url` if it is an absolute http(s) link, otherwise "".
+
+    Every href in the terminal comes from someone else: RSS feeds, SEC filing
+    indexes, Wikidata. html.escape keeps a quote from breaking out of the
+    attribute, but `javascript:alert(1)` needs no quotes and escapes to
+    itself. Browsers also drop tabs, newlines and other control characters
+    inside a scheme, so "java\\tscript:" is checked with those removed.
+    """
+    if not isinstance(url, str):
+        return ""
+    cleaned = "".join(ch for ch in url.strip() if ch >= " " and ch != "\x7f")
+    try:
+        parts = urlsplit(cleaned)
+    except ValueError:
+        return ""
+    if parts.scheme.lower() not in _SAFE_LINK_SCHEMES or not parts.netloc:
+        return ""
+    return cleaned
+
+
+# ==========================================================================
 # NEWS FEED
 # ==========================================================================
 def news_feed(df: pd.DataFrame, max_rows: int = 60,
@@ -605,8 +634,10 @@ def news_feed(df: pd.DataFrame, max_rows: int = 60,
 
         score_text = f"{marker} {score:+.2f}" if score is not None and not pd.isna(score) else marker
 
-        title = html.escape(str(article.get("title", "")))[:200]
-        link = str(article.get("link", "") or "")
+        # Cut before escaping: cutting after could split an entity, leaving
+        # "AT&am" on screen where the headline said "AT&T".
+        title = html.escape(str(article.get("title", ""))[:200])
+        link = safe_url(article.get("link"))
         title_html = (
             f'<a href="{html.escape(link)}" target="_blank" rel="noopener noreferrer">{title}</a>'
             if link else title
@@ -846,11 +877,11 @@ def social_links(social: Dict[str, Any], size: int = 11) -> str:
     for platform, entry in social.items():
         if not isinstance(entry, dict):
             continue
-        url = entry.get("url")
-        # str(), not truthiness: a missing value arriving from a DataFrame is
-        # NaN, and NaN is truthy - it reached .startswith() and crashed the
-        # whole page with "'float' object has no attribute 'startswith'".
-        if url is None or not isinstance(url, str) or not url.strip():
+        # safe_url rejects non-strings too: a missing value arriving from a
+        # DataFrame is NaN, and NaN is truthy - it once reached .startswith()
+        # and crashed the whole page.
+        url = safe_url(entry.get("url"))
+        if not url:
             continue
 
         glyph, color = _SOCIAL_STYLE.get(platform, (platform.upper()[:3], THEME.cyan))
@@ -863,7 +894,7 @@ def social_links(social: Dict[str, Any], size: int = 11) -> str:
         else:
             label = handle[:26]
         parts.append(
-            f'<a href="{html.escape(entry["url"])}" target="_blank" '
+            f'<a href="{html.escape(url)}" target="_blank" rel="noopener noreferrer" '
             f'style="display:inline-block;border:1px solid {THEME.border};'
             f'padding:1px 6px;margin:2px 4px 2px 0;font-size:{size}px;'
             f'color:{color} !important;text-decoration:none;">'

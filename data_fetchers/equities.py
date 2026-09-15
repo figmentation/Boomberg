@@ -21,15 +21,21 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
 import config
 from utils.cache import cached, get_session
-from utils.rate_limiter import retry_with_backoff, throttled
+from utils.rate_limiter import (
+    circuit_breaker,
+    is_transient_error,
+    retry_with_backoff,
+    throttled,
+)
 
 log = logging.getLogger("openterm.equities")
 
@@ -42,6 +48,19 @@ except Exception as exc:  # pragma: no cover
     log.error("yfinance import failed: %s", exc)
     yf = None  # type: ignore[assignment]
     YFINANCE_AVAILABLE = False
+
+# Make yfinance raise network failures instead of logging them and handing
+# back an empty frame. An empty frame is also what a mistyped symbol gets, so
+# in the default mode an outage and a typo were indistinguishable and no
+# circuit breaker could trip on one without tripping on the other. Measured
+# with the network cut: history("AAPL") came back empty by default and
+# raised curl's ConnectionError in this mode, while a bad symbol on a live
+# network raises an HTTP 404 - permanent, and ignored by the breaker.
+if YFINANCE_AVAILABLE:
+    try:
+        yf.config.debug.hide_exceptions = False
+    except Exception:  # pragma: no cover - yfinance < 1.0 has no config object
+        pass
 
 # OpenBB is a heavy optional extra. Detect once, use if present.
 try:
@@ -57,6 +76,25 @@ SEC_TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 SEC_COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 
+# Circuit breakers, one per upstream, shared by every fetcher that calls it.
+#
+# They sit INSIDE @retry_with_backoff, so each failed attempt counts and the
+# failure that trips the circuit ends the retry loop. Outside it, a dead
+# network had to exhaust three whole retry budgets before anything failed
+# fast. Once open, CircuitOpen is raised without a request; the retry layer
+# does not retry it, on_giveup returns the usual empty value, and @cached
+# serves the last good one.
+#
+# Only network-shaped failures count. A 404 for a mistyped symbol proves the
+# upstream is up and must not blank quotes on every other page, and neither
+# must a legitimately empty answer such as a symbol with no listed options.
+_yahoo_circuit = circuit_breaker("yfinance", failure_threshold=2,
+                                 recovery_timeout=60.0,
+                                 trip_on=is_transient_error, count_empty=False)
+_sec_circuit = circuit_breaker("sec", failure_threshold=3,
+                               recovery_timeout=120.0,
+                               trip_on=is_transient_error, count_empty=False)
+
 
 # ==========================================================================
 # PRICE DATA
@@ -64,6 +102,7 @@ SEC_COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json
 @cached(ttl=config.TTL.daily_bars, namespace="equity_history")
 @throttled("yfinance")
 @retry_with_backoff(on_giveup=lambda exc: pd.DataFrame())
+@_yahoo_circuit
 def get_history(
     ticker: str,
     period: str = "1y",
@@ -110,6 +149,7 @@ def get_history(
 @cached(ttl=config.TTL.quote, namespace="equity_quote")
 @throttled("yfinance")
 @retry_with_backoff(on_giveup=lambda exc: {})
+@_yahoo_circuit
 def get_quote(ticker: str) -> Dict[str, Any]:
     """
     Current (15-minute delayed) snapshot quote.
@@ -136,6 +176,10 @@ def get_quote(ticker: str) -> Dict[str, Any]:
         day_low = _safe_float(fi.get("dayLow"))
         market_cap = _safe_float(fi.get("marketCap"))
     except Exception as exc:
+        # The history fallback below uses the same network. When that is
+        # down, trying it doubles the cost of every attempt for nothing.
+        if is_transient_error(exc):
+            raise
         log.debug("fast_info failed for %s: %s", ticker, exc)
 
     # Fallback: derive from recent daily bars.
@@ -173,6 +217,7 @@ def get_quote(ticker: str) -> Dict[str, Any]:
 @cached(ttl=config.TTL.quote, namespace="equity_quotes_batch")
 @throttled("yfinance")
 @retry_with_backoff(on_giveup=lambda exc: {})
+@_yahoo_circuit
 def get_quotes_batch(tickers: Tuple[str, ...]) -> Dict[str, Dict[str, Any]]:
     """
     Snapshot quotes for many symbols in ONE Yahoo round trip.
@@ -201,6 +246,7 @@ def get_quotes_batch(tickers: Tuple[str, ...]) -> Dict[str, Dict[str, Any]]:
     )
 
     if raw is None or raw.empty:
+        _raise_if_download_offline(symbols[0])
         raise ValueError("Batch quote download returned nothing")
 
     out: Dict[str, Dict[str, Any]] = {}
@@ -230,6 +276,22 @@ def get_quotes_batch(tickers: Tuple[str, ...]) -> Dict[str, Dict[str, Any]]:
     if not out:
         raise ValueError("Batch quote produced no usable rows")
     return out
+
+
+def _raise_if_download_offline(symbol: str) -> None:
+    """
+    Surface a network failure that yf.download swallowed.
+
+    yf.download never raises: it catches each symbol's error, logs it and
+    returns an empty frame, so a dead network looks like a batch of symbols
+    that had no bars and the breaker never trips on the one call that runs
+    on every page. Only on that empty result, one symbol is re-requested
+    through Ticker.history, which raises network errors in the mode set at
+    import. A reachable Yahoo returns or 404s here, and the caller's
+    "returned nothing" error stands.
+    """
+    yf.Ticker(symbol).history(period="5d", interval="1d",
+                              timeout=config.NET.request_timeout)
 
 
 # ==========================================================================
@@ -280,6 +342,7 @@ def currency_prefix(code: Optional[str]) -> str:
 @cached(ttl=config.TTL.listing, namespace="equity_currency")
 @throttled("yfinance")
 @retry_with_backoff()
+@_yahoo_circuit
 def get_quote_currency(ticker: str) -> str:
     """
     The currency Yahoo quotes a listing in: 'USD' for VOO, 'SGD' for D05.SI,
@@ -574,6 +637,7 @@ def summarize_technicals(df: pd.DataFrame) -> Dict[str, Any]:
 @cached(ttl=config.TTL.fundamentals, namespace="equity_info")
 @throttled("yfinance")
 @retry_with_backoff(on_giveup=lambda exc: {})
+@_yahoo_circuit
 def get_company_info(ticker: str) -> Dict[str, Any]:
     """
     Company description, sector, and the valuation multiples Yahoo publishes.
@@ -621,6 +685,7 @@ def get_company_info(ticker: str) -> Dict[str, Any]:
 @cached(ttl=config.TTL.fundamentals, namespace="equity_financials")
 @throttled("yfinance")
 @retry_with_backoff(on_giveup=lambda exc: {})
+@_yahoo_circuit
 def get_financial_statements(ticker: str, quarterly: bool = False) -> Dict[str, pd.DataFrame]:
     """
     Income statement, balance sheet and cash flow from Yahoo.
@@ -680,6 +745,7 @@ def _sec_session():
 @cached(ttl=86400 * 7, namespace="sec_ticker_map")
 @throttled("sec")
 @retry_with_backoff(on_giveup=lambda exc: {})
+@_sec_circuit
 def get_sec_ticker_map() -> Dict[str, str]:
     """
     Ticker -> zero-padded 10-digit CIK.
@@ -709,6 +775,7 @@ def ticker_to_cik(ticker: str) -> Optional[str]:
 @cached(ttl=config.TTL.sec_filings, namespace="sec_filings")
 @throttled("sec")
 @retry_with_backoff(on_giveup=lambda exc: pd.DataFrame())
+@_sec_circuit
 def get_sec_filings(
     ticker: str,
     form_types: Tuple[str, ...] = ("10-K", "10-Q", "8-K"),
@@ -889,6 +956,7 @@ _XBRL_CONCEPTS: Dict[str, Dict[str, List[str]]] = {
 @cached(ttl=config.TTL.fundamentals, namespace="sec_facts")
 @throttled("sec")
 @retry_with_backoff(on_giveup=lambda exc: {})
+@_sec_circuit
 def get_sec_company_facts(ticker: str) -> Dict[str, Any]:
     """
     Raw XBRL company facts - every numeric value the company ever tagged.
@@ -1293,6 +1361,7 @@ def suggest_peers(ticker: str, max_peers: int = 6) -> List[str]:
 @cached(ttl=config.TTL.intraday, namespace="equity_options")
 @throttled("yfinance")
 @retry_with_backoff(on_giveup=lambda exc: {})
+@_yahoo_circuit
 def get_options_chain(ticker: str, expiry: Optional[str] = None) -> Dict[str, Any]:
     """
     Options chain for one expiry, plus a put/call ratio.
@@ -1339,31 +1408,202 @@ def get_options_chain(ticker: str, expiry: Optional[str] = None) -> Dict[str, An
 # published suffix table and yfinance's own MIC -> suffix map.
 _SINGLE_LETTER_EXCHANGES = frozenset({"V", "F", "T", "L"})
 
+# Bloomberg yellow keys that change how the root is read. EQUITY is the
+# default reading; the other three name asset classes Yahoo spells
+# differently (^GSPC, EURUSD=X, CL=F).
+_YELLOW_KEYS = frozenset({"EQUITY", "INDEX", "COMDTY", "CURNCY"})
+
+# Longer than any symbol with share class, exchange code and yellow key.
+# Input past it is a paste accident; normalising it would only mint a junk
+# cache key and a request Yahoo refuses.
+_MAX_TICKER_INPUT = 48
+
+# The first token of a Bloomberg equity ticker: a root, possibly carrying a
+# Yahoo suffix already or a slashed share class (BRK/B).
+_SYMBOL_ROOT = re.compile(r"[A-Z0-9][A-Z0-9./-]{0,11}")
+
+# Bloomberg exchange code -> Yahoo suffix. Bloomberg prints composite codes
+# (US, LN, GR) and venue codes (UN, UW, GY) interchangeably, so both are
+# listed. None marks China's composite, where the venue is read off the
+# number. An unlisted code is dropped and the root quoted as-is - which is
+# what happened to every code before this table, and why VOD LN used to
+# quote Vodafone's US ADR in dollars.
+_BLOOMBERG_EXCHANGES: Dict[str, Optional[str]] = {
+    # United States
+    "US": "", "UN": "", "UW": "", "UQ": "", "UA": "", "UP": "", "UR": "",
+    "UF": "", "UV": "",
+    # Canada
+    "CN": ".TO", "CT": ".TO", "CV": ".V",
+    # Europe
+    "LN": ".L", "GR": ".DE", "GY": ".DE", "GF": ".F", "FP": ".PA",
+    "NA": ".AS", "BB": ".BR", "IM": ".MI", "SM": ".MC", "SW": ".SW",
+    "SE": ".SW", "VX": ".SW", "SS": ".ST", "DC": ".CO", "NO": ".OL",
+    "FH": ".HE", "ID": ".IR", "PL": ".LS", "AV": ".VI",
+    # Asia-Pacific
+    "JP": ".T", "JT": ".T", "HK": ".HK", "CH": None, "CG": ".SS",
+    "CS": ".SZ", "KS": ".KS", "KQ": ".KQ", "TT": ".TW", "SP": ".SI",
+    "AU": ".AX", "AT": ".AX", "NZ": ".NZ", "IN": ".NS", "IS": ".NS",
+    "IB": ".BO", "MK": ".KL", "IJ": ".JK", "TB": ".BK",
+    # Latin America, Africa, Middle East
+    "BZ": ".SA", "BS": ".SA", "MM": ".MX", "SJ": ".JO", "IT": ".TA",
+}
+
+# Bloomberg index tickers whose Yahoo symbol is not simply "^" + the root.
+_BLOOMBERG_INDICES: Dict[str, str] = {
+    "SPX": "^GSPC", "INDU": "^DJI", "CCMP": "^IXIC", "NDX": "^NDX",
+    "RTY": "^RUT", "VIX": "^VIX", "MOVE": "^MOVE", "DXY": "DX-Y.NYB",
+    "SPTSX": "^GSPTSE", "UKX": "^FTSE", "DAX": "^GDAXI", "CAC": "^FCHI",
+    "SX5E": "^STOXX50E", "AEX": "^AEX", "IBEX": "^IBEX", "SMI": "^SSMI",
+    "FTSEMIB": "FTSEMIB.MI", "NKY": "^N225", "HSI": "^HSI",
+    "SHCOMP": "000001.SS", "SZCOMP": "399001.SZ", "KOSPI": "^KS11",
+    "TWSE": "^TWII", "AS51": "^AXJO", "STI": "^STI", "SENSEX": "^BSESN",
+    "NIFTY": "^NSEI", "IBOV": "^BVSP", "MEXBOL": "^MXX",
+    # Treasury yields, which Bloomberg files under INDEX.
+    "USGG3M": "^IRX", "USGG5YR": "^FVX", "USGG10YR": "^TNX",
+    "USGG30YR": "^TYX",
+}
+
+# Generic futures: Bloomberg root -> Yahoo root. A commodity root missing
+# here is tried as-is (KC1 -> KC=F). An index future must be listed, because
+# an unknown root under INDEX is an index, not a contract.
+_BLOOMBERG_COMMODITY_ROOTS: Dict[str, str] = {
+    "CO": "BZ",                                 # Brent
+    "XB": "RB", "LC": "LE", "LH": "HE",         # RBOB, live cattle, lean hogs
+    "W": "ZW", "C": "ZC", "S": "ZS", "SM": "ZM", "BO": "ZL", "O": "ZO",
+    "TY": "ZN", "US": "ZB", "FV": "ZF", "TU": "ZT",
+}
+_BLOOMBERG_INDEX_FUTURES: Dict[str, str] = {
+    "ES": "ES", "NQ": "NQ", "DM": "YM", "RTY": "RTY",
+}
+
+# Only the first generic is mapped: Yahoo's =F symbol is the front contract,
+# and serving it for CL2 would put the wrong month's price under the name.
+_GENERIC_FUTURE = re.compile(r"([A-Z]{1,3})([1-9][0-9]?)")
+
+# Crosses quoted base-USD by market convention; other ISO codes are USD-base,
+# so "EUR Curncy" is EUR/USD and "JPY Curncy" is USD/JPY, as on Bloomberg.
+_QUOTED_AGAINST_USD = frozenset({"EUR", "GBP", "AUD", "NZD"})
+_BLOOMBERG_CRYPTO: Dict[str, str] = {
+    "XBT": "BTC", "XET": "ETH", "BTC": "BTC", "ETH": "ETH",
+}
+
+
+def is_bloomberg_listing(tokens: Sequence[str]) -> bool:
+    """
+    True for a Bloomberg equity ticker typed without its yellow key:
+    VOD LN, BRK B, BRK B US. Lets the command bar route those to the equity
+    page instead of rejecting LN or B as an unknown function.
+    """
+    if not 2 <= len(tokens) <= 3:
+        return False
+    root, rest = str(tokens[0]).upper(), [str(t).upper() for t in tokens[1:]]
+    if rest[-1] in _BLOOMBERG_EXCHANGES:
+        rest.pop()
+    return (bool(_SYMBOL_ROOT.fullmatch(root)) and len(rest) <= 1
+            and all(len(t) == 1 and t.isalpha() for t in rest))
+
+
+def _bloomberg_equity(parts: List[str]) -> str:
+    """["VOD", "LN"] -> "VOD.L"; ["BRK", "B", "US"] -> "BRK-B"; ["AAPL"] -> "AAPL"."""
+    root, rest = parts[0].replace("/", "-"), parts[1:]
+    suffix: Optional[str] = ""
+    if rest and rest[-1] in _BLOOMBERG_EXCHANGES:
+        code = rest.pop()
+        suffix = _BLOOMBERG_EXCHANGES[code]
+        if suffix is None:
+            # Shanghai numbers its issues from 6 (A shares) and 9 (B shares);
+            # Shenzhen from 0, 2 and 3.
+            suffix = ".SS" if root.startswith(("6", "9")) else ".SZ"
+        if code == "HK" and root.isdigit():
+            root = root.zfill(4)            # Yahoo pads Hong Kong: 0700.HK
+        if "." in root:
+            suffix = ""                     # root already has a Yahoo suffix
+    if len(rest) == 1 and len(rest[0]) == 1 and rest[0].isalpha():
+        root = f"{root}-{rest[0]}"
+    return root + (suffix or "")
+
+
+def _bloomberg_index(symbol: str) -> str:
+    """SPX -> ^GSPC, ES1 -> ES=F, GDAXI -> ^GDAXI."""
+    if symbol.startswith("^") or "=" in symbol or "." in symbol:
+        return symbol
+    if symbol in _BLOOMBERG_INDICES:
+        return _BLOOMBERG_INDICES[symbol]
+    generic = _GENERIC_FUTURE.fullmatch(symbol)
+    if generic and generic.group(1) in _BLOOMBERG_INDEX_FUTURES:
+        if generic.group(2) != "1":
+            return symbol
+        return f"{_BLOOMBERG_INDEX_FUTURES[generic.group(1)]}=F"
+    return f"^{symbol}"
+
+
+def _bloomberg_commodity(symbol: str) -> str:
+    """CL1 -> CL=F, CO1 -> BZ=F, W1 -> ZW=F. Later generics pass through."""
+    if "=" in symbol:
+        return symbol
+    generic = _GENERIC_FUTURE.fullmatch(symbol)
+    if not generic or generic.group(2) != "1":
+        return symbol
+    root = generic.group(1)
+    return f"{_BLOOMBERG_COMMODITY_ROOTS.get(root, root)}=F"
+
+
+def _bloomberg_currency(pair: str) -> str:
+    """EURUSD -> EURUSD=X, JPY -> USDJPY=X, XBTUSD -> BTC-USD."""
+    pair = pair.replace("/", "")
+    if "=" in pair or "-" in pair:
+        return pair
+    crypto = _BLOOMBERG_CRYPTO.get(pair[:3])
+    if crypto:
+        return f"{crypto}-{pair[3:] or 'USD'}"
+    if len(pair) == 6 and pair.isalpha():
+        return f"{pair}=X"
+    if len(pair) == 3 and pair.isalpha():
+        return f"{pair}USD=X" if pair in _QUOTED_AGAINST_USD else f"USD{pair}=X"
+    return pair
+
 
 def normalize_ticker(ticker: str) -> str:
     """
     Coerce user input into a Yahoo-compatible symbol.
 
-    Handles the common cases: whitespace, lowercase, Bloomberg-style
-    "AAPL US Equity", and the class-share dot/dash mismatch (BRK.B -> BRK-B).
+    Handles whitespace, lowercase, the class-share dot/dash mismatch
+    (BRK.B -> BRK-B), and Bloomberg tickers, whose exchange code and yellow
+    key carry what Yahoo encodes in the symbol itself:
+
+        VOD LN Equity  -> VOD.L        BRK/B US Equity -> BRK-B
+        700 HK         -> 0700.HK      SPX Index       -> ^GSPC
+        EURUSD Curncy  -> EURUSD=X     CL1 Comdty      -> CL=F
 
     A US share class whose letter is also an exchange code reads as the
     exchange when typed with a dot: MKC.V is kept as a TSX Venture symbol, so
     McCormick's voting stock has to be typed the way Yahoo lists it, MKC-V.
     The asymmetry decides it - a share class has a dash spelling that passes
     through untouched, and an exchange listing has no other spelling at all.
+
+    Input longer than any real ticker returns "" rather than a truncated
+    symbol that would quote something else.
     """
     if not ticker:
         return ""
 
     t = str(ticker).strip().upper()
+    if len(t) > _MAX_TICKER_INPUT:
+        return ""
 
-    # "AAPL US EQUITY" / "VOD LN EQUITY" -> take the root symbol.
     parts = t.split()
-    if len(parts) > 1 and parts[-1] in {"EQUITY", "INDEX", "COMDTY", "CURNCY"}:
-        t = parts[0]
-    elif len(parts) > 1:
-        t = parts[0]
+    if not parts:
+        return ""
+
+    yellow = parts.pop() if len(parts) > 1 and parts[-1] in _YELLOW_KEYS else None
+    if yellow == "INDEX":
+        return _bloomberg_index("".join(parts))
+    if yellow == "CURNCY":
+        return _bloomberg_currency("".join(parts))
+    if yellow == "COMDTY":
+        return _bloomberg_commodity("".join(parts))
+
+    t = _bloomberg_equity(parts)
 
     # Yahoo uses '-' for share classes; users type '.'. But leave real
     # suffixes alone (.TO, .L, .HK, ...) - those are exchange codes. Length
@@ -1421,6 +1661,7 @@ __all__ = [
     "get_company_info", "get_financial_statements",
     "get_sec_filings", "get_sec_financials", "get_sec_company_facts",
     "ticker_to_cik", "get_peer_comparison", "suggest_peers",
-    "get_options_chain", "normalize_ticker", "format_large_number",
+    "get_options_chain", "normalize_ticker", "is_bloomberg_listing",
+    "format_large_number",
     "YFINANCE_AVAILABLE", "OPENBB_AVAILABLE",
 ]

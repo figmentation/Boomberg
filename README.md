@@ -36,6 +36,13 @@ Command bar accepts Bloomberg-style syntax: `<SUBJECT> <FUNCTION>`. Type `HELP`
 for the full reference. Every module is pictured under
 [Screenshots](#screenshots).
 
+Bloomberg tickers keep their listing and asset class: `VOD LN` quotes London
+(`VOD.L`), not the US ADR; `BRK B` and `BRK/B US EQUITY` quote `BRK-B`;
+`700 HK` quotes `0700.HK`. The `INDEX`, `CURNCY` and `COMDTY` yellow keys open
+the same quote page: `SPX INDEX` → `^GSPC`, `EURUSD CURNCY` → `EURUSD=X`,
+`CL1 COMDTY` → `CL=F`. Only the first generic future is mapped, because
+Yahoo's `=F` symbol is the front contract.
+
 ---
 
 ## Screenshots
@@ -476,6 +483,36 @@ is "0.0% above cost", because that reads exactly like a real result. The
 figures are stored with the edition, so an archived brief describes the book
 as it was that morning.
 
+### Access control and audit
+
+On your own machine nothing changes: there is one user, and that user is
+admin. Set `OPENTERM_MULTI_USER=1` for a shared deployment and three layers
+take over, each replaceable on its own:
+
+| Layer | Where | Decides |
+|---|---|---|
+| Identity | `utils/identity.py` | Who the session is — Streamlit's OIDC sign-in (`[auth]` in `.streamlit/secrets.toml`) |
+| Assignment | `entitlements.toml` | Which role each account or email domain holds |
+| Role table | `config.ROLE_PERMISSIONS` | What `viewer`, `analyst` and `admin` may do |
+
+A **viewer** opens every market page and changes nothing shared. An
+**analyst** adds their own portfolio, watchlist and brief, and REFRESH. An
+**admin** adds PURGE and the audit log (`AUDIT`). Every doubtful case refuses
+access rather than guessing: an anonymous session, an unlisted account, a
+misspelt role, an unparseable file, or an email address the provider flags as
+unverified — which never matches a user or domain grant. Copy
+`entitlements.example.toml` to start.
+
+Every command (including rejected and refused ones), page run, sign-in and
+change is appended to `.openterm/audit.sqlite`. SQLite triggers refuse
+updates and deletes, and each row hashes the one before it, so the audit page
+reports the first row an edit to the file broke. Saving a portfolio, WATCH,
+rebuilding the brief, REFRESH and PURGE are written to the log *before* they
+run, and do not run if the write fails. Free text is scrubbed of the
+configured API keys and anything shaped like a credential before it is
+stored; the log names the actor by account, so the file is the deployment
+administrator's.
+
 ### Resilience
 
 Free data sources fail constantly. Three layers handle it:
@@ -675,6 +712,8 @@ downloaded corpus data.
 | `OPENTERM_DEBUG=1` | Full tracebacks in the UI, debug logging |
 | `OPENTERM_OFFLINE=1` | Render from cache only, zero network calls |
 | `OPENTERM_ALLOW_SCRAPERS=1` | Enable the ToS-restricted scraper fallbacks |
+| `OPENTERM_MULTI_USER=1` | Shared deployment: sign-in required, roles from the entitlements file, portfolios stored per user under `.openterm/users/` |
+| `OPENTERM_ENTITLEMENTS=path` | Role assignment file (default `entitlements.toml` next to `app.py`) |
 
 ## Requirements
 

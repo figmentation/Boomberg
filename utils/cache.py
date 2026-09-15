@@ -16,6 +16,10 @@ Design notes:
   * A `stale` read path exists. When the network is down, `@cached` will
     happily serve an expired entry rather than show the user nothing - it
     tags the result so the UI can display an "AS OF" warning.
+  * An empty result never replaces a non-empty one. Most fetchers turn an
+    outage into an empty value rather than an exception, so without this
+    rule the first refetch during an outage overwrote the last good quote
+    with `{}` and the stale path above never got the chance to run.
 """
 
 from __future__ import annotations
@@ -27,14 +31,20 @@ import pickle
 import sqlite3
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 import config
+from utils.rate_limiter import looks_empty
 
 log = logging.getLogger("openterm.cache")
 
 F = TypeVar("F", bound=Callable[..., Any])
+
+# How long an empty result is remembered when there is no earlier value to
+# fall back on. Short, because an empty answer is as likely to be an outage
+# as a fact, and a daily TTL would keep the page blank long after recovery.
+EMPTY_RESULT_TTL = 120
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS kv (
@@ -269,6 +279,7 @@ def cached(
     namespace: Optional[str] = None,
     allow_stale_on_error: bool = True,
     key_fn: Optional[Callable[..., str]] = None,
+    keep_last_good: bool = True,
 ) -> Callable[[F], F]:
     """
     Memoise a fetcher into SQLite.
@@ -281,10 +292,20 @@ def cached(
                               is what keeps the terminal readable when an
                               upstream free API goes down mid-session.
         key_fn:               Custom key builder, receives the call args.
+        keep_last_good:       If the wrapped call returns an empty value
+                              ({}, [], empty frame, None) while a non-empty one
+                              is on record, serve the recorded one, marked
+                              stale, and leave it in place. An empty result
+                              with nothing to protect is cached for at most
+                              EMPTY_RESULT_TTL seconds.
 
     The wrapper exposes two extras:
         fn.cache_clear()      Drop every entry in this namespace.
         fn.uncached(*a, **k)  Bypass the cache for one call.
+
+    Pass `_refresh=True` to skip the fresh read for one call. The existing
+    entry stays in place until a good value replaces it, so a refresh during
+    an outage still has something to fall back on.
 
     Provenance for the *most recent* call is recorded on
     `fn.last_entry` (a CacheEntry or None) so the UI can render an age badge.
@@ -296,11 +317,8 @@ def cached(
 
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
-            if kwargs.pop("_refresh", False):
-                key = key_fn(*args, **kwargs) if key_fn else make_key(ns, *args, **kwargs)
-                cache.delete(key)
-            else:
-                key = key_fn(*args, **kwargs) if key_fn else make_key(ns, *args, **kwargs)
+            refresh = kwargs.pop("_refresh", False)
+            key = key_fn(*args, **kwargs) if key_fn else make_key(ns, *args, **kwargs)
 
             # Offline mode: cache is the only source of truth.
             if config.OFFLINE:
@@ -312,10 +330,11 @@ def cached(
                     )
                 return entry.value
 
-            entry = cache.get(key)
-            if entry is not None:
-                wrapper.last_entry = entry  # type: ignore[attr-defined]
-                return entry.value
+            if not refresh:
+                entry = cache.get(key)
+                if entry is not None:
+                    wrapper.last_entry = entry  # type: ignore[attr-defined]
+                    return entry.value
 
             try:
                 value = func(*args, **kwargs)
@@ -327,14 +346,27 @@ def cached(
                             "%s failed (%s) - serving stale value from %s",
                             ns, exc, stale.age_label(),
                         )
-                        wrapper.last_entry = stale  # type: ignore[attr-defined]
+                        wrapper.last_entry = replace(stale, stale=True)  # type: ignore[attr-defined]
                         return stale.value
                 raise
 
-            cache.set(key, value, ttl=ttl, namespace=ns)
+            entry_ttl = ttl
+            if keep_last_good and looks_empty(value):
+                previous = cache.get(key, allow_stale=True)
+                if previous is not None and not looks_empty(previous.value):
+                    log.warning(
+                        "%s returned nothing - keeping the value from %s",
+                        ns, previous.age_label(),
+                    )
+                    wrapper.last_entry = replace(previous, stale=True)  # type: ignore[attr-defined]
+                    return previous.value
+                entry_ttl = min(ttl, EMPTY_RESULT_TTL)
+
+            cache.set(key, value, ttl=entry_ttl, namespace=ns)
+            now = time.time()
             wrapper.last_entry = CacheEntry(  # type: ignore[attr-defined]
-                value=value, created_at=time.time(),
-                expires_at=time.time() + ttl, stale=False,
+                value=value, created_at=now,
+                expires_at=now + entry_ttl, stale=False,
             )
             return value
 

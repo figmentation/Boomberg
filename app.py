@@ -20,9 +20,10 @@ from __future__ import annotations
 import html
 import logging
 import sys
+import time
 import traceback
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, MutableMapping, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -48,6 +49,7 @@ from data_fetchers import allocation, sectors  # noqa: E402
 from ui import components as ui  # noqa: E402
 from ui import maps  # noqa: E402
 from ui.terminal_theme import THEME, apply_theme  # noqa: E402
+from utils import audit, entitlements, identity  # noqa: E402
 from utils.cache import clear_all_caches, get_cache  # noqa: E402
 from utils.rate_limiter import (  # noqa: E402
     bucket_status,
@@ -67,6 +69,11 @@ apply_theme()
 # ==========================================================================
 # COMMAND PARSER
 # ==========================================================================
+# Yellow keys that stay on the subject. They are what tells normalize_ticker
+# that SPX means ^GSPC rather than a stock called SPX.
+_ASSET_CLASS_KEYS = frozenset({"INDEX", "CURNCY", "COMDTY"})
+
+
 def parse_command(raw: str) -> Dict[str, Any]:
     """
     Parse a Bloomberg-style command into a route.
@@ -88,6 +95,16 @@ def parse_command(raw: str) -> Dict[str, Any]:
     }
 
     if not raw or not raw.strip():
+        return result
+
+    # Refused before it is tokenised, normalised, used as a cache key or
+    # echoed back. Nothing real comes close to the limit.
+    if len(raw) > config.MAX_COMMAND_LENGTH:
+        result["raw"] = raw[:config.MAX_COMMAND_LENGTH]
+        result["message"] = (
+            f"Command too long ({len(raw)} characters, limit "
+            f"{config.MAX_COMMAND_LENGTH})."
+        )
         return result
 
     tokens = raw.strip().upper().split()
@@ -130,6 +147,8 @@ def parse_command(raw: str) -> Dict[str, Any]:
     subject = " ".join(tokens[:-1])
 
     if function in config.COMMAND_FUNCTIONS:
+        if function in _ASSET_CLASS_KEYS:
+            subject = f"{subject} {function}"
         result.update({
             "module": config.COMMAND_FUNCTIONS[function],
             "subject": subject,
@@ -144,6 +163,12 @@ def parse_command(raw: str) -> Dict[str, Any]:
             "subject": " ".join(tokens[1:]),
             "valid": True,
         })
+        return result
+
+    # A Bloomberg equity ticker typed without its yellow key: VOD LN, BRK B.
+    if equities.is_bloomberg_listing(tokens):
+        result.update({"module": "equity", "subject": " ".join(tokens),
+                       "valid": True})
         return result
 
     result["message"] = (
@@ -174,15 +199,52 @@ def init_state() -> None:
         st.session_state.setdefault(key, value)
 
 
+def _audit(event: str, principal: Optional[entitlements.Principal] = None,
+           **fields: Any) -> bool:
+    """Record an audit event for this session. True if it was written."""
+    return audit.record(event, principal or entitlements.current_principal(),
+                        session=audit.session_id(), **fields)
+
+
+def authorize_command(principal: entitlements.Principal,
+                      parsed: Dict[str, Any]) -> Optional[str]:
+    """
+    Why `principal` may not run a parsed command, or None if it may.
+
+    Checked before the command touches session state, so a refused command
+    neither switches the page nor applies its subject.
+    """
+    module = parsed["module"]
+    if not principal.can(f"module:{module}"):
+        return (f"Your role ({principal.role_label}) does not include "
+                f"{module.upper().replace('_', ' ')}.")
+    if (module == "portfolio" and parsed["subject"]
+            and not principal.can("portfolio.write")):
+        return f"Your role ({principal.role_label}) cannot edit the watchlist."
+    return None
+
+
 def execute_command(raw: str) -> None:
     """Route a command string, updating session state."""
     parsed = parse_command(raw)
+    principal = entitlements.current_principal()
 
     if not parsed["valid"]:
         if parsed["message"]:
             st.session_state["command_error"] = parsed["message"]
+            _audit(audit.COMMAND, principal, outcome="rejected",
+                   subject=parsed["raw"], detail={"reason": parsed["message"]})
         return
 
+    denial = authorize_command(principal, parsed)
+    if denial:
+        st.session_state["command_error"] = denial
+        _audit(audit.COMMAND, principal, outcome="denied",
+               module=parsed["module"], subject=parsed["raw"])
+        return
+
+    _audit(audit.COMMAND, principal, module=parsed["module"],
+           subject=parsed["raw"])
     st.session_state.pop("command_error", None)
     st.session_state["module"] = parsed["module"]
     st.session_state["last_command"] = parsed["raw"]
@@ -192,51 +254,92 @@ def execute_command(raw: str) -> None:
         history.append(parsed["raw"])
         st.session_state["command_history"] = history[-25:]
 
-    subject = parsed["subject"]
-    if not subject:
-        return
+    if parsed["subject"]:
+        route_subject(st.session_state, parsed["module"], parsed["subject"])
 
-    module = parsed["module"]
+
+def news_category_for(subject: str) -> Optional[str]:
+    """
+    The news desk a command subject names, or None.
+
+    Matched on whole words of the desk name, so ENERGY and COMMODITY both
+    reach "ENERGY / COMMODITY", while tickers that happen to be substrings of
+    a desk name - MA in MARKETS, GE in GEOPOLITICS - stay tickers.
+    """
+    words = set(str(subject).upper().replace("/", " ").split())
+    if not words:
+        return None
+    for category in config.RSS_FEEDS:
+        if words <= set(category.replace("/", " ").split()):
+            return category
+    return None
+
+
+def route_subject(state: MutableMapping[str, Any], module: str,
+                  subject: str) -> None:
+    """
+    Apply a command's subject to session state.
+
+    Takes the state mapping as an argument rather than reaching for
+    st.session_state, so the routing is testable with a plain dict.
+    """
     if module in ("equity", "supply_chain", "fundamentals"):
         # These modules key off the same ticker, so "NVDA SPLC" and "NVDA FA"
         # both set it and switching pages keeps the name you were looking at.
-        st.session_state["ticker"] = equities.normalize_ticker(subject)
+        state["ticker"] = equities.normalize_ticker(subject)
     elif module == "maritime":
         if subject in config.CHOKEPOINTS:
-            st.session_state["chokepoint"] = subject
-            st.session_state["vessel_query"] = ""
+            state["chokepoint"] = subject
+            state["vessel_query"] = ""
         else:
-            st.session_state["vessel_query"] = subject
+            state["vessel_query"] = subject
     elif module == "aviation":
         if subject in config.AVIATION_REGIONS:
-            st.session_state["aviation_region"] = subject
+            state["aviation_region"] = subject
     elif module == "news":
+        # A desk name wins: ENERGY NEWS opens the energy desk. Desk matching
+        # used to sit in a second `elif module == "news"` further down this
+        # chain, where the ticker branch shadowed it, so desk commands were
+        # accepted and then silently did nothing.
+        category = news_category_for(subject)
+        if category:
+            state["news_category"] = category
+            # The desk picker is a keyed widget, and its remembered selection
+            # outlives a new default. Dropping it lets the default apply.
+            state.pop("news_cats", None)
+            return
         # "NVDA SOCIAL" should land on the social tab already looking at NVDA.
-        # Anything that normalises to a plausible symbol sets the shared
-        # ticker; a category word like ENERGY does not.
         symbol = equities.normalize_ticker(subject).upper()
         if symbol and symbol.isalpha() and len(symbol) <= 5:
-            st.session_state["ticker"] = symbol
+            state["ticker"] = symbol
     elif module == "portfolio":
         # "NVDA WATCH" adds a symbol without a trip to the editor. The add is
         # idempotent and the row is deletable, so a typo costs one click.
+        principal = entitlements.current_principal()
+        if not principal.can("portfolio.write"):
+            state["command_error"] = (
+                "Sign in to add to your watchlist."
+                if config.MULTI_USER and not principal.user.authenticated
+                else f"Your role ({principal.role_label}) cannot edit the watchlist."
+            )
+            return
         symbol = equities.normalize_ticker(subject)
-        if portfolio.add_to_watchlist(symbol):
-            st.session_state["portfolio_toast"] = f"{symbol} added to watchlist."
+        # Recorded before the write, and the write refused if the record
+        # fails: an unrecorded change is what an audit trail exists to rule out.
+        if not _audit(audit.WATCHLIST_ADD, principal, module="portfolio",
+                      subject=symbol):
+            state["command_error"] = "Audit log unavailable - watchlist not changed."
+            return
+        if portfolio.add_to_watchlist(symbol, user=principal.user.key):
+            state["portfolio_toast"] = f"{symbol} added to watchlist."
     elif module == "macro":
         upper = subject.upper()
         if any(token in upper for token in ("CPI", "INFLATION", "PCE")):
-            st.session_state["macro_view"] = "INFLATION"
+            state["macro_view"] = "INFLATION"
         elif any(token in upper for token in ("YCRV", "CURVE", "10Y", "2Y", "30Y")):
-            st.session_state["macro_view"] = "YIELD CURVE"
+            state["macro_view"] = "YIELD CURVE"
         elif any(token in upper for token in ("JOBS", "UNEMPLOY", "PAYROLL")):
-            st.session_state["macro_view"] = "LABOR"
-    elif module == "news":
-        upper = subject.upper()
-        for category in config.RSS_FEEDS:
-            if upper in category or category.split(" / ")[0] in upper:
-                st.session_state["news_category"] = category
-                break
+            state["macro_view"] = "LABOR"
 
 
 # ==========================================================================
@@ -259,7 +362,7 @@ def render_tape() -> None:
     ui.ticker_tape(_tape_quotes(), labels)
 
 
-def render_command_bar() -> None:
+def render_command_bar(principal: entitlements.Principal) -> None:
     """Top command input plus quick-jump function buttons."""
     left, right = st.columns([5, 1])
 
@@ -294,6 +397,9 @@ def render_command_bar() -> None:
         ("FA", "fundamentals"), ("NEWS", "news"), ("PF", "portfolio"),
         ("HELP", "help"),
     ]
+    # A button for a page the role cannot open would only produce a refusal.
+    shortcuts = [(label, module) for label, module in shortcuts
+                 if principal.can(f"module:{module}")]
     cols = st.columns(len(shortcuts))
     for col, (label, module) in zip(cols, shortcuts):
         with col:
@@ -304,8 +410,27 @@ def render_command_bar() -> None:
                 st.rerun()
 
 
-def render_sidebar() -> None:
-    """Data-source health, cache controls, diagnostics."""
+def _render_account(principal: entitlements.Principal) -> None:
+    """Who this session is, its role, and the account actions it has."""
+    who = principal.user.display if principal.user.authenticated else "LOCAL"
+    st.markdown(
+        f'<div style="font-size:11px;margin:2px 0 8px;">'
+        f'{ui.badge(principal.role_label, "amber")} '
+        f'<span style="color:{THEME.muted};">{html.escape(who)}</span></div>',
+        unsafe_allow_html=True,
+    )
+    if principal.can("audit.read") and st.button(
+            "AUDIT LOG", key="side_audit", use_container_width=True):
+        st.session_state["module"] = "audit"
+        st.rerun()
+    if principal.user.authenticated and st.button(
+            "SIGN OUT", key="side_logout", use_container_width=True):
+        _audit(audit.AUTH_LOGOUT, principal)
+        st.logout()
+
+
+def render_sidebar(principal: entitlements.Principal) -> None:
+    """Account, data-source health, cache controls, diagnostics."""
     with st.sidebar:
         st.markdown(
             f'<div style="color:{THEME.amber};font-size:17px;font-weight:700;'
@@ -314,6 +439,7 @@ def render_sidebar() -> None:
             unsafe_allow_html=True,
         )
         st.caption("Free financial & OSINT intelligence")
+        _render_account(principal)
 
         # --- Credentials --------------------------------------------------
         st.markdown("### DATA SOURCES")
@@ -377,20 +503,29 @@ def render_sidebar() -> None:
         else:
             st.caption("Cache empty")
 
+        # Both buttons act on state every session shares, so both are gated
+        # and audited rather than left to whoever happens to be looking.
+        can_purge = principal.can("cache.purge")
+        can_refresh = principal.can("cache.refresh")
         col_a, col_b = st.columns(2)
         with col_a:
-            if st.button("PURGE", use_container_width=True):
-                clear_all_caches()
-                st.cache_data.clear()
-                reset_all_circuits()
-                st.success("Cache cleared")
-                st.rerun()
+            if st.button("PURGE", use_container_width=True, disabled=not can_purge,
+                         help=None if can_purge else "Requires the admin role"):
+                if _authorized("cache.purge", audit.CACHE_PURGE):
+                    clear_all_caches()
+                    st.cache_data.clear()
+                    reset_all_circuits()
+                    st.success("Cache cleared")
+                    st.rerun()
         with col_b:
-            if st.button("REFRESH", use_container_width=True):
-                st.cache_data.clear()
-                # Give tripped sources another chance on an explicit refresh.
-                reset_all_circuits()
-                st.rerun()
+            if st.button("REFRESH", use_container_width=True,
+                         disabled=not can_refresh,
+                         help=None if can_refresh else "Requires the analyst role"):
+                if _authorized("cache.refresh", audit.CACHE_REFRESH):
+                    st.cache_data.clear()
+                    # Give tripped sources another chance on an explicit refresh.
+                    reset_all_circuits()
+                    st.rerun()
 
         # --- Circuit breakers ---------------------------------------------
         circuits = circuit_status()
@@ -1311,19 +1446,27 @@ def page_supply_chain() -> None:
                 if pd.notna(row["counterparty_ticker"]):
                     tag += ui.badge(row["counterparty_ticker"], "amber")
 
+                # Name, quote and link all come out of a filing's text, so all
+                # three are escaped, and the link must be http(s).
+                source = ui.safe_url(row["source_url"])
+                source_html = (
+                    f'<a href="{html.escape(source)}" target="_blank" '
+                    f'rel="noopener noreferrer" '
+                    f'style="font-size:9px;color:{THEME.cyan};">SOURCE FILING →</a>'
+                    if source else ""
+                )
                 st.markdown(
                     f'<div style="border:1px solid {THEME.border};border-left:3px '
                     f'solid {accent};padding:7px 10px;margin-bottom:6px;">'
                     f'<div style="display:flex;justify-content:space-between;">'
                     f'<span style="color:{THEME.white};font-size:13px;font-weight:700;">'
-                    f'{row["counterparty"]}</span>'
+                    f'{html.escape(str(row["counterparty"]))}</span>'
                     f'<span style="color:{THEME.amber};font-size:14px;">'
                     f'{row["pct_of_revenue"]:.0f}%</span></div>'
                     f'<div style="margin:3px 0;">{tag}</div>'
                     f'<div style="color:{THEME.muted};font-size:10px;'
-                    f'font-style:italic;">“{row["quote"]}”</div>'
-                    f'<a href="{row["source_url"]}" target="_blank" '
-                    f'style="font-size:9px;color:{THEME.cyan};">SOURCE FILING →</a>'
+                    f'font-style:italic;">“{html.escape(str(row["quote"]))}”</div>'
+                    f'{source_html}'
                     f'</div>',
                     unsafe_allow_html=True,
                 )
@@ -3534,12 +3677,20 @@ def page_portfolio() -> None:
         "HOLDINGS · MARK-TO-MARKET · 08:00 SGT BRIEF",
     )
 
+    principal = entitlements.current_principal()
+    if not principal.can("module:portfolio"):
+        ui.alert(f"Your role ({principal.role_label}) does not include the "
+                 "portfolio.", "warn")
+        return
+    user = principal.user.key
+    can_write = principal.can("portfolio.write")
+
     toast = st.session_state.pop("portfolio_toast", None)
     if toast:
         ui.alert(toast, "ok")
 
-    stored_holdings = portfolio.holdings()
-    stored_watchlist = portfolio.watchlist()
+    stored_holdings = portfolio.holdings(user)
+    stored_watchlist = portfolio.watchlist(user)
 
     with st.spinner("Marking positions to market…"):
         valued = portfolio.value_positions(stored_holdings)
@@ -3599,12 +3750,15 @@ def page_portfolio() -> None:
         left, right = st.columns([1, 5])
         with left:
             if st.button("SAVE", key="pf_save_holdings",
-                         use_container_width=True):
-                portfolio.save(edited, stored_watchlist)
-                st.success("Holdings saved.")
-                st.rerun()
+                         use_container_width=True, disabled=not can_write):
+                if _authorized("portfolio.write", audit.PORTFOLIO_SAVE,
+                               module="portfolio",
+                               detail={"table": "holdings", "rows": len(edited)}):
+                    portfolio.save(edited, stored_watchlist, user)
+                    st.success("Holdings saved.")
+                    st.rerun()
         with right:
-            st.caption(f"Stored at `{config.PORTFOLIO_FILE}`")
+            st.caption(f"Stored at `{portfolio.portfolio_path(user)}`")
 
         if valued.empty:
             ui.alert("No positions yet. Add a row above and save.", "warn")
@@ -3672,10 +3826,13 @@ def page_portfolio() -> None:
                 "note": st.column_config.TextColumn("NOTE"),
             },
         )
-        if st.button("SAVE", key="pf_save_watch"):
-            portfolio.save(stored_holdings, edited_watch)
-            st.success("Watchlist saved.")
-            st.rerun()
+        if st.button("SAVE", key="pf_save_watch", disabled=not can_write):
+            if _authorized("portfolio.write", audit.PORTFOLIO_SAVE,
+                           module="portfolio",
+                           detail={"table": "watchlist", "rows": len(edited_watch)}):
+                portfolio.save(stored_holdings, edited_watch, user)
+                st.success("Watchlist saved.")
+                st.rerun()
 
         quotes = portfolio.watchlist_quotes(stored_watchlist)
         if quotes.empty:
@@ -3697,7 +3854,7 @@ def page_portfolio() -> None:
                 "warn")
             return
 
-        archive = portfolio.stored_editions()
+        archive = portfolio.stored_editions(user=user)
         controls = st.columns([2, 1, 3])
         with controls[0]:
             options = [edition] + [d for d in archive if d != edition]
@@ -3709,13 +3866,16 @@ def page_portfolio() -> None:
         with controls[1]:
             st.write("")
             rebuild = st.button("REBUILD", key="pf_brief_rebuild",
-                                use_container_width=True)
+                                use_container_width=True, disabled=not can_write)
+        if rebuild and not _authorized("portfolio.write", audit.BRIEF_REBUILD,
+                                       module="portfolio"):
+            rebuild = False
 
         if chosen == edition:
             with st.spinner("Reading the tape for your positions…"):
-                brief = portfolio.get_brief(force=rebuild)
+                brief = portfolio.get_brief(force=rebuild, user=user)
         else:
-            brief = portfolio.load_edition(chosen) or {}
+            brief = portfolio.load_edition(chosen, user=user) or {}
 
         if not brief or brief.get("empty"):
             ui.alert("Nothing recorded for this edition.", "warn")
@@ -3803,6 +3963,147 @@ def page_portfolio() -> None:
                 ui.news_feed(stories, max_rows=8)
 
 
+# ==========================================================================
+# ACCESS CONTROL & AUDIT
+# ==========================================================================
+def _authorized(permission: str, event: str, **fields: Any) -> bool:
+    """
+    Gate a state-changing action.
+
+    The role must include `permission`, and the action is written to the
+    audit log BEFORE it happens. If that write fails the action is refused:
+    an unrecorded change is exactly what an audit trail exists to rule out.
+    Both refusals are recorded where the log allows.
+    """
+    principal = entitlements.current_principal()
+    if not principal.can(permission):
+        _audit(event, principal, outcome="denied", **fields)
+        ui.alert(f"Your role ({principal.role_label}) does not permit this.",
+                 "warn")
+        return False
+    if not _audit(event, principal, **fields):
+        ui.alert("Audit log unavailable - action refused.", "error")
+        return False
+    return True
+
+
+def _audit_session(principal: entitlements.Principal) -> None:
+    """One auth.session row per browser session and identity, not per rerun."""
+    marker = f"{principal.user.key}:{principal.role}"
+    if st.session_state.get("_audit_identity") == marker:
+        return
+    if _audit(audit.AUTH_SESSION, principal,
+              outcome="ok" if principal.has_access else "denied"):
+        st.session_state["_audit_identity"] = marker
+
+
+def render_access_gate(principal: entitlements.Principal) -> None:
+    """The whole terminal, for a session with no role: sign in, or ask for one."""
+    ui.module_header("OPEN-TERMINAL", "ACCESS CONTROLLED")
+
+    if not principal.user.authenticated:
+        if not identity.login_available():
+            ui.alert(
+                "OPENTERM_MULTI_USER is on, but no sign-in provider is "
+                "configured under [auth] in .streamlit/secrets.toml, so no one "
+                "can be admitted.", "error")
+            return
+        ui.alert("This terminal is shared. Sign in to continue.", "warn")
+        if st.button("SIGN IN", key="gate_login"):
+            _audit(audit.AUTH_LOGIN, principal)
+            st.login()
+        return
+
+    ui.alert(
+        f"Signed in as {principal.user.display}, but this account has no role "
+        f"on this terminal. Ask an administrator to add it to "
+        f"{config.ENTITLEMENTS_FILE.name}.", "warn")
+    if st.button("SIGN OUT", key="gate_logout"):
+        _audit(audit.AUTH_LOGOUT, principal)
+        st.logout()
+
+
+def page_audit() -> None:
+    ui.module_header("AUDIT LOG", "COMMANDS · PAGE RUNS · PRIVILEGED ACTIONS")
+
+    principal = entitlements.current_principal()
+    if not principal.can("audit.read"):
+        ui.alert(f"Your role ({principal.role_label}) does not include the "
+                 "audit log.", "warn")
+        return
+
+    trail = audit.get_audit_log()
+    intact, broken_at, checked = trail.verify()
+    head = trail.head_hash()
+    ui.metric_row([
+        ui.metric_tile("ENTRIES", checked, value_format="{:,.0f}",
+                       subtitle="rows verified"),
+        ui.metric_tile("HASH CHAIN",
+                       "INTACT" if intact else
+                       (f"BROKEN AT #{broken_at}" if broken_at else "UNREADABLE"),
+                       accent=THEME.green if intact else THEME.red,
+                       subtitle="recomputed on every load"),
+        ui.metric_tile("HEAD", head[:16] if head else "—",
+                       subtitle="newest row hash"),
+        ui.metric_tile("YOUR ROLE", principal.role_label,
+                       subtitle="MULTI-USER" if config.MULTI_USER else "SINGLE-USER"),
+    ], columns=4)
+    st.caption(
+        "Triggers refuse edits and deletes made through SQLite, and the hash "
+        "chain exposes an edit made to the file directly. Removing the newest "
+        "rows leaves a shorter chain that still verifies, so record the HEAD "
+        "hash elsewhere if you need to show nothing was removed."
+    )
+
+    controls = st.columns([3, 1, 2, 1])
+    with controls[0]:
+        events = st.multiselect("EVENTS", list(audit.EVENT_TYPES), key="audit_events")
+    with controls[1]:
+        outcome = st.selectbox("OUTCOME", ["ALL", *audit.OUTCOMES], key="audit_outcome")
+    with controls[2]:
+        actor = st.text_input("ACTOR CONTAINS", key="audit_actor", max_chars=80)
+    with controls[3]:
+        limit = st.selectbox("ROWS", [100, 500, 2000], index=1, key="audit_limit")
+
+    rows = trail.recent(limit=limit, events=events,
+                        outcome=None if outcome == "ALL" else outcome,
+                        actor=actor.strip() or None)
+    if not rows:
+        ui.alert("No audit entries match.", "warn")
+    else:
+        full = pd.DataFrame(rows)
+        shown = full.assign(hash=full["hash"].str.slice(0, 12))
+        st.dataframe(shown, use_container_width=True, hide_index=True, height=520)
+        # A download cannot be withdrawn once the browser has it, so the
+        # export is recorded best-effort rather than gated on the write.
+        st.download_button(
+            "EXPORT CSV", full.to_csv(index=False).encode("utf-8"),
+            file_name=f"openterm-audit-{datetime.now(timezone.utc):%Y%m%d-%H%M%S}.csv",
+            mime="text/csv", key="audit_export",
+            on_click=lambda: _audit(audit.AUDIT_EXPORT, module="audit",
+                                    detail={"rows": len(rows)}),
+        )
+
+    with st.expander("ROLE MATRIX"):
+        permissions = sorted(set().union(*config.ROLE_PERMISSIONS.values()))
+        st.dataframe(pd.DataFrame(
+            {role: ["✓" if p in granted else "" for p in permissions]
+             for role, granted in config.ROLE_PERMISSIONS.items()},
+            index=permissions), use_container_width=True)
+        if config.MULTI_USER:
+            source = config.ENTITLEMENTS_FILE
+            state = entitlements.load_assignments()
+            st.caption(
+                f"Accounts are assigned roles in `{source}`"
+                + (f" — {state.error}; every account is refused until it is fixed."
+                   if state.error else
+                   ". Edits apply on each user's next interaction, no restart.")
+            )
+        else:
+            st.caption("Single-user mode: the local user is admin and no "
+                       "entitlements file is read.")
+
+
 ROUTES = {
     "home": page_home,
     "equity": page_equity,
@@ -3814,33 +4115,60 @@ ROUTES = {
     "news": page_news,
     "portfolio": page_portfolio,
     "help": page_help,
+    "audit": page_audit,
 }
 
 
 def main() -> None:
     init_state()
-    render_sidebar()
+    principal = entitlements.current_principal()
+    _audit_session(principal)
+    if not principal.has_access:
+        render_access_gate(principal)
+        return
+
+    render_sidebar(principal)
     render_tape()
-    render_command_bar()
+    render_command_bar(principal)
     st.markdown("<hr/>", unsafe_allow_html=True)
 
     module = st.session_state.get("module", "home")
+    if not principal.can(f"module:{module}"):
+        # Commands are authorised before they switch pages. This catches every
+        # other route in: history buttons, pages that set the module, a role
+        # revoked mid-session.
+        _audit(audit.ACCESS_DENIED, principal, outcome="denied", module=module)
+        ui.alert(f"Your role ({principal.role_label}) does not include "
+                 f"{module.upper()}.", "warn")
+        module = st.session_state["module"] = "home"
     page = ROUTES.get(module, page_home)
 
+    started = time.monotonic()
     try:
         page()
     except Exception as exc:
         log.exception("Page '%s' crashed", module)
+        _audit(audit.PAGE_ERROR, principal, outcome="error", module=module,
+               detail={"error": type(exc).__name__, "message": str(exc)})
         ui.alert(f"Module error: {exc}", "error")
         if config.DEBUG:
             st.code(traceback.format_exc())
         else:
             st.caption("Set OPENTERM_DEBUG=1 for a full traceback.")
+    else:
+        # A page run is recorded when the page changes, not on every rerun -
+        # Streamlit reruns on every click, and a row per click buries the
+        # events a reviewer is looking for.
+        if st.session_state.get("_audit_module") != module:
+            if _audit(audit.PAGE_VIEW, principal, module=module,
+                      detail={"render_ms": round((time.monotonic() - started) * 1000)}):
+                st.session_state["_audit_module"] = module
 
     # --- Status bar --------------------------------------------------------
     credentials = config.credential_status()
     ui.status_bar({
         "MODULE": module.upper(),
+        "ROLE": principal.role_label,
         "LAST CMD": st.session_state.get("last_command") or "—",
         "TIME": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
         "FRED": "KEY" if credentials["FRED"] else "KEYLESS",

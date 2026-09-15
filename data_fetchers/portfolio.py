@@ -6,6 +6,10 @@ in a plain JSON file under .openterm/ rather than in the SQLite cache. The
 cache is disposable by design - the sidebar's PURGE button empties it - and
 holdings are not.
 
+Every store function takes the owner's key from utils.identity. The local
+user reads and writes the original .openterm/portfolio.json and briefs/;
+each signed-in user gets .openterm/users/<key>/ and can reach nothing else.
+
 The brief is an *edition*, not a background job. Asking a Streamlit app to run
 something at 08:00 assumes a process is alive at 08:00, which for a local
 terminal is exactly when it is not. So each edition is stamped with the SGT
@@ -19,14 +23,17 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
 import config
 from data_fetchers import allocation, equities, news
+from utils.identity import LOCAL_USER
 
 log = logging.getLogger("openterm.portfolio")
 
@@ -42,11 +49,36 @@ WATCHLIST_COLUMNS = ["ticker", "note"]
 # ==========================================================================
 # 1. STORE
 # ==========================================================================
+# utils.identity hashes account identifiers, so a real key always has this
+# shape. Checking anyway guarantees a key cannot walk a path out of USERS_DIR.
+_USER_KEY = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def _user_dir(user: str) -> Path:
+    if not isinstance(user, str) or not _USER_KEY.fullmatch(user):
+        raise ValueError("Invalid portfolio owner key")
+    return config.USERS_DIR / user
+
+
+def portfolio_path(user: str = LOCAL_USER) -> Path:
+    """Where `user`'s holdings and watchlist are stored."""
+    if user == LOCAL_USER:
+        return config.PORTFOLIO_FILE
+    return _user_dir(user) / "portfolio.json"
+
+
+def brief_dir(user: str = LOCAL_USER) -> Path:
+    """Where `user`'s morning-brief editions are stored."""
+    if user == LOCAL_USER:
+        return config.BRIEF_DIR
+    return _user_dir(user) / "briefs"
+
+
 def _empty_store() -> Dict[str, List[Dict[str, Any]]]:
     return {"holdings": [], "watchlist": []}
 
 
-def load() -> Dict[str, List[Dict[str, Any]]]:
+def load(user: str = LOCAL_USER) -> Dict[str, List[Dict[str, Any]]]:
     """
     Read the position file. A missing or corrupt file is not an error.
 
@@ -54,7 +86,7 @@ def load() -> Dict[str, List[Dict[str, Any]]]:
     is worse than one that opens empty and lets you retype four rows, so a
     parse failure is logged and the file is left on disk untouched.
     """
-    path = config.PORTFOLIO_FILE
+    path = portfolio_path(user)
     if not path.exists():
         return _empty_store()
 
@@ -91,17 +123,19 @@ def _records(frame: pd.DataFrame, columns: List[str]) -> List[Dict[str, Any]]:
     ]
 
 
-def save(holdings: pd.DataFrame, watchlist: pd.DataFrame) -> None:
+def save(holdings: pd.DataFrame, watchlist: pd.DataFrame,
+         user: str = LOCAL_USER) -> None:
     """Write both tables back, normalised and with empty rows dropped."""
     payload = {
         "holdings": _records(holdings, HOLDING_COLUMNS),
         "watchlist": _records(watchlist, WATCHLIST_COLUMNS),
         "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
-    config.PORTFOLIO_FILE.parent.mkdir(parents=True, exist_ok=True)
+    path = portfolio_path(user)
+    path.parent.mkdir(parents=True, exist_ok=True)
     # allow_nan=False so a future regression fails loudly here rather than
     # writing a file that only Python can read.
-    config.PORTFOLIO_FILE.write_text(
+    path.write_text(
         json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8")
     log.info("Portfolio saved: %d holdings, %d watchlist",
              len(payload["holdings"]), len(payload["watchlist"]))
@@ -138,17 +172,18 @@ def _clean(df: Optional[pd.DataFrame], columns: List[str]) -> pd.DataFrame:
     return out.drop_duplicates(subset=["ticker"], keep="last").reset_index(drop=True)
 
 
-def holdings() -> pd.DataFrame:
+def holdings(user: str = LOCAL_USER) -> pd.DataFrame:
     """Stored holdings, exactly as entered."""
-    return _clean(pd.DataFrame(load()["holdings"]), HOLDING_COLUMNS)
+    return _clean(pd.DataFrame(load(user)["holdings"]), HOLDING_COLUMNS)
 
 
-def watchlist() -> pd.DataFrame:
+def watchlist(user: str = LOCAL_USER) -> pd.DataFrame:
     """Stored watchlist, exactly as entered."""
-    return _clean(pd.DataFrame(load()["watchlist"]), WATCHLIST_COLUMNS)
+    return _clean(pd.DataFrame(load(user)["watchlist"]), WATCHLIST_COLUMNS)
 
 
-def add_to_watchlist(ticker: str, note: str = "") -> bool:
+def add_to_watchlist(ticker: str, note: str = "",
+                     user: str = LOCAL_USER) -> bool:
     """
     Append one symbol. Returns False if it was already there.
 
@@ -159,12 +194,12 @@ def add_to_watchlist(ticker: str, note: str = "") -> bool:
     if not symbol:
         return False
 
-    current = watchlist()
+    current = watchlist(user)
     if not current.empty and symbol in set(current["ticker"]):
         return False
 
     row = pd.DataFrame([{"ticker": symbol, "note": note}])
-    save(holdings(), pd.concat([current, row], ignore_index=True))
+    save(holdings(user), pd.concat([current, row], ignore_index=True), user)
     return True
 
 
@@ -426,16 +461,17 @@ def next_edition_at(now: Optional[datetime] = None) -> datetime:
     return today if moment < today else today + timedelta(days=1)
 
 
-def _brief_path(edition: date):
-    return config.BRIEF_DIR / f"{edition.isoformat()}.json"
+def _brief_path(edition: date, user: str = LOCAL_USER) -> Path:
+    return brief_dir(user) / f"{edition.isoformat()}.json"
 
 
-def stored_editions(limit: int = 14) -> List[date]:
+def stored_editions(limit: int = 14, user: str = LOCAL_USER) -> List[date]:
     """Editions already on disk, newest first."""
-    if not config.BRIEF_DIR.exists():
+    folder = brief_dir(user)
+    if not folder.exists():
         return []
     found = []
-    for path in config.BRIEF_DIR.glob("*.json"):
+    for path in folder.glob("*.json"):
         try:
             found.append(date.fromisoformat(path.stem))
         except ValueError:
@@ -783,7 +819,8 @@ def compose_narrative(book: Optional[Dict[str, Any]],
     return " ".join(sentences)
 
 
-def build_brief(edition: Optional[date] = None) -> Dict[str, Any]:
+def build_brief(edition: Optional[date] = None,
+                user: str = LOCAL_USER) -> Dict[str, Any]:
     """
     Assemble the edition from whatever the portfolio holds right now.
 
@@ -793,7 +830,7 @@ def build_brief(edition: Optional[date] = None) -> Dict[str, Any]:
     sentiment alone just surfaces the loudest writing.
     """
     edition = edition or edition_date()
-    positions = value_positions(holdings())
+    positions = value_positions(holdings(user))
 
     if positions.empty:
         return {
@@ -868,15 +905,15 @@ def build_brief(edition: Optional[date] = None) -> Dict[str, Any]:
     }
 
 
-def _persist(path, brief: Dict[str, Any]) -> None:
+def _persist(path: Path, brief: Dict[str, Any]) -> None:
     try:
-        config.BRIEF_DIR.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(brief, indent=2), encoding="utf-8")
     except Exception as exc:
         log.warning("Could not persist brief %s: %s", path.stem, exc)
 
 
-def get_brief(force: bool = False) -> Dict[str, Any]:
+def get_brief(force: bool = False, user: str = LOCAL_USER) -> Dict[str, Any]:
     """
     Today's edition, built once and reused.
 
@@ -890,7 +927,7 @@ def get_brief(force: bool = False) -> Dict[str, Any]:
     printed SGD and USD added together behind a "$".
     """
     edition = edition_date()
-    path = _brief_path(edition)
+    path = _brief_path(edition, user)
 
     if path.exists() and not force:
         try:
@@ -900,21 +937,21 @@ def get_brief(force: bool = False) -> Dict[str, Any]:
         else:
             if (not brief.get("empty")
                     and "currency" not in (brief.get("book") or {})):
-                positions = value_positions(holdings())
+                positions = value_positions(holdings(user))
                 brief["book"] = book_snapshot(positions, _sector_mix(positions))
                 brief["narrative"] = compose_narrative(
                     brief["book"], brief.get("summary"), brief.get("positions"))
                 _persist(path, brief)
             return brief
 
-    brief = build_brief(edition)
+    brief = build_brief(edition, user)
     _persist(path, brief)
     return brief
 
 
-def load_edition(edition: date) -> Optional[Dict[str, Any]]:
+def load_edition(edition: date, user: str = LOCAL_USER) -> Optional[Dict[str, Any]]:
     """An earlier edition, for the archive selector. None if not on disk."""
-    path = _brief_path(edition)
+    path = _brief_path(edition, user)
     if not path.exists():
         return None
     try:
@@ -925,7 +962,8 @@ def load_edition(edition: date) -> Optional[Dict[str, Any]]:
 
 
 __all__ = [
-    "SGT", "HOLDING_COLUMNS", "WATCHLIST_COLUMNS",
+    "SGT", "HOLDING_COLUMNS", "WATCHLIST_COLUMNS", "LOCAL_USER",
+    "portfolio_path", "brief_dir",
     "load", "save", "holdings", "watchlist", "add_to_watchlist",
     "value_positions", "portfolio_summary", "fx_applied", "watchlist_quotes",
     "sgt_now", "edition_date", "next_edition_at", "stored_editions",

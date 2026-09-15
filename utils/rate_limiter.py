@@ -122,14 +122,24 @@ def retry_with_backoff(
 
 def _is_retryable(exc: BaseException) -> bool:
     """Decide whether an exception represents a transient condition."""
+    # An open circuit refuses the next attempt without making it, so sleeping
+    # before that attempt is pure delay. This covers the failure that tripped
+    # the circuit as well as CircuitOpen itself.
+    if isinstance(exc, CircuitOpen) or getattr(exc, "circuit_tripped", False):
+        return False
+
     # Explicit signal from our own code.
     if isinstance(exc, RateLimitExceeded):
         return True
 
-    # requests.HTTPError and friends expose the response object.
+    # requests.HTTPError and friends expose the response object. Only a real
+    # HTTP status decides, though: curl_cffi (yfinance's transport) attaches
+    # a response to a refused connection too, with no status, and reading
+    # that as a permanent answer meant Yahoo network errors were never
+    # retried and never counted toward a circuit breaker.
     response = getattr(exc, "response", None)
     status = getattr(response, "status_code", None)
-    if status is not None:
+    if isinstance(status, int) and status >= 100:
         return status in RETRYABLE_STATUS
 
     # Network-layer failures: match on type name so we don't need to import
@@ -327,12 +337,18 @@ def throttled(bucket: str = "default", tokens: float = 1.0) -> Callable[[F], F]:
         def fetch_states(...): ...
 
     Order matters: put @throttled outermost so each *retry* also pays a token.
+
+    A call made while the same-named circuit is open skips the bucket: the
+    breaker will refuse it without touching the network, and queueing for a
+    token first turned "fail fast" into "fail after the queue drains".
     """
 
     def decorator(func: F) -> F:
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
-            get_limiter(bucket).acquire(tokens)
+            breaker = _CIRCUITS.get(bucket)
+            if breaker is None or breaker.allow():
+                get_limiter(bucket).acquire(tokens)
             return func(*args, **kwargs)
 
         return wrapper  # type: ignore[return-value]
@@ -440,21 +456,36 @@ def circuit_breaker(
     failure_threshold: int = 3,
     recovery_timeout: float = 120.0,
     on_open: Optional[Callable[[], Any]] = None,
+    trip_on: Optional[Callable[[BaseException], bool]] = None,
+    count_empty: bool = True,
 ) -> Callable[[F], F]:
     """
     Fail fast once a provider has proven itself down.
 
-    Apply OUTSIDE @retry_with_backoff so an open circuit skips the retry
-    budget entirely:
+    Usually applied OUTSIDE @retry_with_backoff so an open circuit skips the
+    retry budget entirely:
 
         @circuit_breaker("fred", on_open=lambda: pd.Series(dtype=float))
         @retry_with_backoff(on_giveup=lambda e: pd.Series(dtype=float))
         def _fred_series_csv(...): ...
 
+    Applied INSIDE the retry loop instead, every failed attempt counts toward
+    the threshold, and the failure that trips the circuit ends the loop
+    rather than sleeping before an attempt that would be refused. That is the
+    right shape when on_giveup hides exceptions from anything outside it.
+
     Args:
-        on_open: Returned instead of raising when the circuit is open. Give
-                 this the same empty value your on_giveup returns so callers
-                 see one consistent "no data" shape.
+        on_open:     Returned instead of raising when the circuit is open. Give
+                     this the same empty value your on_giveup returns so callers
+                     see one consistent "no data" shape.
+        trip_on:     Whether an exception counts as a failure. Default: every
+                     exception. Pass `is_transient_error` for an upstream where
+                     a bad request - a 404 for a mistyped symbol - says nothing
+                     about whether the service is up.
+        count_empty: Whether an empty return counts as a failure. Right for a
+                     fetcher whose on_giveup turns errors into empty values;
+                     wrong where "nothing listed" is a legitimate answer. An
+                     empty return never counts as a success either way.
     """
 
     def decorator(func: F) -> F:
@@ -470,15 +501,19 @@ def circuit_breaker(
 
             try:
                 result = func(*args, **kwargs)
-            except Exception:
-                breaker.record_failure()
+            except Exception as exc:
+                if trip_on is None or trip_on(exc):
+                    breaker.record_failure()
+                    if not breaker.allow():
+                        _mark_tripped(exc)
                 raise
 
             # A fetcher with on_giveup returns an empty value instead of
             # raising, so an exception-only breaker would never trip. Treat an
-            # empty return as a failure signal too.
-            if _looks_empty(result):
-                breaker.record_failure()
+            # empty return as a failure signal too, unless told not to.
+            if looks_empty(result):
+                if count_empty:
+                    breaker.record_failure()
             else:
                 breaker.record_success()
             return result
@@ -488,7 +523,34 @@ def circuit_breaker(
     return decorator
 
 
-def _looks_empty(value: Any) -> bool:
+def _mark_tripped(exc: BaseException) -> None:
+    """Flag the failure that opened a circuit, so a retry loop stops on it."""
+    try:
+        exc.circuit_tripped = True  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover - exception types with __slots__
+        pass
+
+
+def is_transient_error(exc: Optional[BaseException]) -> bool:
+    """
+    True when a failure says the upstream is unreachable, not that the
+    request was wrong.
+
+    Follows the `raise ... from` chain: retry_with_backoff reports a spent
+    budget as UpstreamUnavailable wrapping the real error, and the wrapper's
+    own message quotes that error's text, so the wrapper is skipped rather
+    than matched on.
+    """
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if not isinstance(exc, UpstreamUnavailable) and _is_retryable(exc):
+            return True
+        exc = exc.__cause__
+    return False
+
+
+def looks_empty(value: Any) -> bool:
     """Best-effort 'this fetch produced nothing' check across return types."""
     if value is None:
         return True
@@ -539,6 +601,8 @@ __all__ = [
     "get_limiter",
     "get_circuit",
     "circuit_breaker",
+    "is_transient_error",
+    "looks_empty",
     "circuit_status",
     "reset_all_circuits",
     "throttled",

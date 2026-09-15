@@ -8,6 +8,8 @@
 *.pem
 secrets.toml
 .streamlit/secrets.toml
+# Role assignments name real accounts. entitlements.example.toml IS tracked.
+entitlements.toml
 
 # ============================================================================
 # Open-Terminal runtime state

@@ -1,0 +1,25 @@
+# Open-Terminal role assignments. Read only when OPENTERM_MULTI_USER=1.
+#
+# Copy to entitlements.toml (gitignored - it lists accounts) or point
+# OPENTERM_ENTITLEMENTS at another path. Edits apply on each user's next
+# interaction; no restart needed.
+#
+# Roles and what they may do are defined in config.ROLE_PERMISSIONS:
+#   viewer   every market page, read-only; cannot change anything shared
+#   analyst  + own portfolio, watchlist and brief; REFRESH
+#   admin    + PURGE and the audit log
+#
+# Precedence: [users] entry, then [domains] entry, then default_role.
+# Anything unrecognised - a misspelt role, a broken file - means no access.
+
+# Role for a signed-in account matched by nothing below. "none" refuses it.
+default_role = "none"
+
+[users]
+# "alice@example.com" = "admin"
+# "mallory@example.com" = "none"     # revoke one person inside a domain grant
+
+[domains]
+# Matched only against addresses the sign-in provider has not flagged as
+# unverified.
+# "example.com" = "viewer"

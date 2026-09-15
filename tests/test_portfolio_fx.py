@@ -374,7 +374,7 @@ class TestStaleEdition:
             self, tmp_path, monkeypatch, market):
         path = self._write(tmp_path, monkeypatch,
                            {"positions": 2, "market_value": 1100.0})
-        monkeypatch.setattr(portfolio, "holdings", lambda: _holdings(BOOK))
+        monkeypatch.setattr(portfolio, "holdings", lambda *_args: _holdings(BOOK))
         monkeypatch.setattr(portfolio, "_sector_mix",
                             lambda _frame: pd.DataFrame())
 

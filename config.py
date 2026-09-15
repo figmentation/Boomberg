@@ -24,7 +24,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, FrozenSet, List, Optional, Tuple
 
 # --------------------------------------------------------------------------
 # .env loading (optional dependency - never fatal)
@@ -42,12 +42,27 @@ DATA_DIR = BASE_DIR / ".openterm"
 DATA_DIR.mkdir(exist_ok=True)
 
 CACHE_DB = DATA_DIR / "cache.sqlite"
+
+# Append-only audit trail. Its own file, so PURGE and a deleted cache can
+# never take the record with them.
+AUDIT_DB = DATA_DIR / "audit.sqlite"
 HTTP_CACHE_DB = DATA_DIR / "http_cache"  # requests-cache appends .sqlite
 
 # User-authored state. Deliberately outside the cache: PURGE empties the
 # cache, and a button that also deleted your positions would be a trap.
 PORTFOLIO_FILE = DATA_DIR / "portfolio.json"
 BRIEF_DIR = DATA_DIR / "briefs"
+
+# One directory per signed-in user when MULTI_USER is on. The local user keeps
+# the two paths above, so an existing book needs no migration.
+USERS_DIR = DATA_DIR / "users"
+
+# Which account holds which role, when MULTI_USER is on. Deployment data, not
+# code: see entitlements.example.toml. Lists accounts, so it is gitignored.
+ENTITLEMENTS_FILE = Path(
+    os.getenv("OPENTERM_ENTITLEMENTS", "").strip()
+    or BASE_DIR / "entitlements.toml"
+)
 
 
 # ==========================================================================
@@ -1128,10 +1143,18 @@ REBALANCE_MIN_DRIFT_PCT: float = 2.0
 # sector. Concentration risk is a property of the position, not the sector.
 POSITION_CONCENTRATION_PCT: float = 20.0
 
+# Longest command the bar accepts. The longest real one - a Bloomberg ticker
+# with share class, exchange and yellow key, plus a function - is about 30.
+MAX_COMMAND_LENGTH: int = 80
+
 COMMAND_FUNCTIONS: Dict[str, str] = {
     # Equities
     "EQUITY": "equity", "EQ": "equity", "GP": "equity", "DES": "equity",
-    "FA": "equity", "CN": "equity",
+    "CN": "equity",
+    # Bloomberg yellow keys for other asset classes. The quote and chart page
+    # already handles indices, FX crosses and front-month futures; the parser
+    # keeps the key on the subject so SPX INDEX resolves to ^GSPC.
+    "INDEX": "equity", "CURNCY": "equity", "COMDTY": "equity",
     # Supply chain & counterparty risk
     "SPLC": "supply_chain", "SUPPLY": "supply_chain", "SC": "supply_chain",
     "SPLY": "supply_chain",
@@ -1157,6 +1180,8 @@ COMMAND_FUNCTIONS: Dict[str, str] = {
     "ALLOC": "portfolio", "ALLOCATION": "portfolio", "REBAL": "portfolio",
     # Home
     "HOME": "home", "MENU": "home", "DASH": "home",
+    # Audit trail (admin)
+    "AUDIT": "audit",
 }
 
 HELP_TEXT = """
@@ -1164,6 +1189,10 @@ COMMAND SYNTAX:  <SUBJECT> <FUNCTION>
 
   AAPL EQUITY      Equity analytics: chart, indicators, fundamentals, EDGAR
   NVDA GP          Same - GP is the Bloomberg price-graph mnemonic
+  VOD LN EQUITY    Bloomberg tickers keep their listing: London, not the ADR
+  BRK B            Share class and exchange codes work without a yellow key
+  SPX INDEX        Indices, FX and front-month futures on the same page
+  EURUSD CURNCY    Also CL1 COMDTY, USGG10YR INDEX, XBTUSD CURNCY
   AAPL SPLC        Supply chain: counterparties, geography, commodity, credit
   SPLC             Supply chain for the ticker already loaded
   SUEZ SHIP        Maritime chokepoint monitor
@@ -1180,7 +1209,38 @@ COMMAND SYNTAX:  <SUBJECT> <FUNCTION>
   NVDA WATCH       Add a symbol to the watchlist without opening the editor
   HOME             Return to the overview dashboard
   HELP             This screen
+  AUDIT            Audit trail of commands, page runs and changes (admin)
 """.strip()
+
+
+# ==========================================================================
+# ENTITLEMENTS
+# ==========================================================================
+# What each role may do, in one table, so an access review reads this rather
+# than the code. Accounts are mapped to roles in ENTITLEMENTS_FILE; a single-
+# user install (MULTI_USER off) is always admin and reads no file.
+#
+#   module:<route>   open the page, and run commands that land on it
+#   portfolio.write  save holdings or watchlist, WATCH from the command bar,
+#                    rebuild the morning brief
+#   cache.refresh    clear the page cache and reset circuit breakers - shared
+#                    by every session, which is why viewers cannot
+#   cache.purge      delete every cached value
+#   audit.read       view and export the audit trail
+#
+# Every role must include module:home: it is where a session lands when it
+# asks for a page its role does not include.
+_MARKET_MODULES = ("home", "equity", "supply_chain", "maritime", "aviation",
+                   "macro", "fundamentals", "news", "help")
+_VIEWER = tuple(f"module:{name}" for name in _MARKET_MODULES)
+_ANALYST = _VIEWER + ("module:portfolio", "portfolio.write", "cache.refresh")
+_ADMIN = _ANALYST + ("cache.purge", "module:audit", "audit.read")
+
+ROLE_PERMISSIONS: Dict[str, FrozenSet[str]] = {
+    "viewer": frozenset(_VIEWER),
+    "analyst": frozenset(_ANALYST),
+    "admin": frozenset(_ADMIN),
+}
 
 
 # ==========================================================================
@@ -1189,6 +1249,11 @@ COMMAND SYNTAX:  <SUBJECT> <FUNCTION>
 DEBUG: bool = os.getenv("OPENTERM_DEBUG", "0") == "1"
 # Set to "1" to disable every network call and render from cache only.
 OFFLINE: bool = os.getenv("OPENTERM_OFFLINE", "0") == "1"
+# Set to "1" when several people share one deployment. Portfolios are then
+# reachable only after st.login(). Without it every session is the one local
+# user - right for a terminal on your own machine, and wrong on a server,
+# where it would show every visitor the same book.
+MULTI_USER: bool = os.getenv("OPENTERM_MULTI_USER", "0") == "1"
 
 
 def credential_status() -> Dict[str, bool]:

@@ -190,7 +190,7 @@ class TestLegacyEditionBackfill:
             raise AssertionError("legacy edition was rebuilt")
 
         monkeypatch.setattr(portfolio, "build_brief", no_rebuild)
-        monkeypatch.setattr(portfolio, "holdings", lambda: pd.DataFrame())
+        monkeypatch.setattr(portfolio, "holdings", lambda *_args: pd.DataFrame())
         monkeypatch.setattr(portfolio, "value_positions",
                             lambda _frame: _positions(book_rows))
         monkeypatch.setattr(portfolio, "_sector_mix", lambda _frame: sectors)

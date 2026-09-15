@@ -52,6 +52,33 @@ def reset_circuits():
     reset_all_circuits()
 
 
+@pytest.fixture(autouse=True)
+def isolated_audit_log(tmp_path, monkeypatch):
+    """
+    Audit writes made by code under test go to a throwaway file.
+
+    The log is append-only by design, so a test that wrote to the real
+    .openterm/audit.sqlite would leave rows there that nothing can remove.
+    """
+    from utils import audit
+
+    log = audit.AuditLog(path=str(tmp_path / "audit.sqlite"))
+    monkeypatch.setattr(audit, "_log_singleton", log)
+    return log
+
+
+@pytest.fixture(autouse=True)
+def single_user_mode(monkeypatch):
+    """
+    Tests run as the single-user install unless they opt in to multi-user.
+    Without this, OPENTERM_MULTI_USER=1 in a developer's .env would flip
+    every entitlement and portfolio test.
+    """
+    import config
+
+    monkeypatch.setattr(config, "MULTI_USER", False)
+
+
 # ==========================================================================
 # Reference data
 # ==========================================================================

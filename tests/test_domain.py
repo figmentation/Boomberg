@@ -85,6 +85,31 @@ class TestCommandParser:
         assert not self.parse("")["valid"]
         assert not self.parse("   ")["valid"]
 
+    @pytest.mark.parametrize("raw,symbol", [
+        ("SPX INDEX", "^GSPC"),           # B10: rejected as an unknown function
+        ("EURUSD CURNCY", "EURUSD=X"),    # B10
+        ("CL1 COMDTY", "CL=F"),
+        ("VOD LN EQUITY", "VOD.L"),       # B4: quoted the US ADR
+        ("VOD LN", "VOD.L"),              # B4: rejected - LN "unknown function"
+        ("BRK B", "BRK-B"),               # B4: rejected - B "unknown function"
+        ("BRK/B US EQUITY", "BRK-B"),
+    ])
+    def test_bloomberg_commands_route_to_equity(self, raw, symbol):
+        result = self.parse(raw)
+        assert result["valid"], result["message"]
+        assert result["module"] == "equity"
+        assert equities.normalize_ticker(result["subject"]) == symbol
+
+    def test_fa_routes_to_fundamentals(self):
+        """FA was defined twice in COMMAND_FUNCTIONS; the equity copy was dead."""
+        assert self.parse("NVDA FA")["module"] == "fundamentals"
+
+    def test_overlong_command_rejected(self):
+        result = self.parse("AAPL " * 40)
+        assert not result["valid"]
+        assert "too long" in result["message"]
+        assert len(result["raw"]) <= config.MAX_COMMAND_LENGTH
+
     def test_every_configured_function_resolves(self):
         """Guards against adding a COMMAND_FUNCTIONS entry with no route."""
         import app
@@ -104,7 +129,7 @@ class TestNormalizeTicker:
         ("BRK.B", "BRK-B"),          # share class: dot -> dash
         ("BF.B", "BF-B"),
         ("AAPL US Equity", "AAPL"),  # Bloomberg-style input
-        ("VOD LN Equity", "VOD"),
+        ("VOD LN Equity", "VOD.L"),  # the London line, not the US ADR
     ])
     def test_normalisation(self, raw, expected):
         assert equities.normalize_ticker(raw) == expected
@@ -185,6 +210,138 @@ class TestNormalizeTicker:
         except Exception as exc:
             pytest.skip(f"Yahoo unreachable: {exc}")
         assert not bars.empty, f"{raw} -> {symbol} returned no data"
+
+
+class TestBloombergSymbology:
+    """
+    Bloomberg tickers carry the listing and asset class in separate tokens;
+    Yahoo encodes both in the symbol. Dropping the tokens quoted the wrong
+    instrument - VOD LN became Vodafone's US ADR, in dollars - rather than
+    failing, which is the worse outcome.
+    """
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("VOD LN", "VOD.L"),
+        ("vod ln equity", "VOD.L"),
+        ("BRK B US Equity", "BRK-B"),
+        ("BRK/B US Equity", "BRK-B"),
+        ("BRK B", "BRK-B"),
+        ("BT/A LN", "BT-A.L"),
+        ("AAPL UW Equity", "AAPL"),
+        ("7203 JT Equity", "7203.T"),
+        ("700 HK", "0700.HK"),            # Yahoo pads Hong Kong codes
+        ("SAP GY", "SAP.DE"),
+        ("RY CN Equity", "RY.TO"),
+        ("D05 SP", "D05.SI"),
+        ("NESN SW", "NESN.SW"),
+        ("600519 CH", "600519.SS"),       # China composite: Shanghai
+        ("000858 CH", "000858.SZ"),       # China composite: Shenzhen
+        ("VOD.L LN", "VOD.L"),            # suffix not doubled
+        ("AAPL XX", "AAPL"),              # unknown code: root, as before
+    ])
+    def test_equities(self, raw, expected):
+        assert equities.normalize_ticker(raw) == expected
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("SPX Index", "^GSPC"),
+        ("INDU INDEX", "^DJI"),
+        ("UKX INDEX", "^FTSE"),
+        ("USGG10YR INDEX", "^TNX"),
+        ("ES1 INDEX", "ES=F"),
+        ("GDAXI INDEX", "^GDAXI"),        # unlisted root: Yahoo's own spelling
+        ("^GSPC INDEX", "^GSPC"),
+    ])
+    def test_indices(self, raw, expected):
+        assert equities.normalize_ticker(raw) == expected
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("EURUSD Curncy", "EURUSD=X"),
+        ("EUR/USD CURNCY", "EURUSD=X"),
+        ("EUR CURNCY", "EURUSD=X"),       # market convention: EUR/USD
+        ("JPY CURNCY", "USDJPY=X"),       # market convention: USD/JPY
+        ("XBTUSD CURNCY", "BTC-USD"),
+    ])
+    def test_currencies(self, raw, expected):
+        assert equities.normalize_ticker(raw) == expected
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("CL1 COMDTY", "CL=F"),
+        ("CO1 Comdty", "BZ=F"),
+        ("W 1 COMDTY", "ZW=F"),
+        ("KC1 COMDTY", "KC=F"),
+        ("CL2 COMDTY", "CL2"),            # no Yahoo symbol for the 2nd month
+    ])
+    def test_commodities(self, raw, expected):
+        assert equities.normalize_ticker(raw) == expected
+
+    def test_oversized_input_rejected(self):
+        assert equities.normalize_ticker("A" * 49) == ""
+
+    @pytest.mark.parametrize("tokens,expected", [
+        (["VOD", "LN"], True), (["BRK", "B"], True), (["BRK", "B", "US"], True),
+        (["FOO", "BARBAZ"], False), (["A", "B", "C"], False), (["AAPL"], False),
+    ])
+    def test_listing_detection(self, tokens, expected):
+        assert equities.is_bloomberg_listing(tokens) is expected
+
+    @pytest.mark.network
+    @pytest.mark.parametrize("raw", [
+        "VOD LN", "BRK B", "700 HK", "SAP GY", "SPX INDEX", "EURUSD CURNCY",
+        "JPY CURNCY", "CL1 COMDTY", "XBTUSD CURNCY", "USGG10YR INDEX",
+    ])
+    def test_mapped_symbol_quotes_live(self, raw):
+        import yfinance as yf
+
+        symbol = equities.normalize_ticker(raw)
+        try:
+            bars = yf.Ticker(symbol).history(period="5d")
+        except Exception as exc:
+            pytest.skip(f"Yahoo unreachable: {exc}")
+        assert not bars.empty, f"{raw} -> {symbol} returned no data"
+
+
+class TestSubjectRouting:
+    @pytest.fixture(autouse=True)
+    def _app(self):
+        import app
+        self.app = app
+
+    def test_desk_word_sets_news_category(self):
+        """B6: ENERGY NEWS was accepted and then ignored."""
+        state = {"ticker": "AAPL", "news_category": "MARKETS",
+                 "news_cats": ["MARKETS"]}
+        self.app.route_subject(state, "news", "ENERGY")
+        assert state["news_category"] == "ENERGY / COMMODITY"
+        assert state["ticker"] == "AAPL"
+        assert "news_cats" not in state, "desk widget kept its old selection"
+
+    def test_full_command_path(self):
+        parsed = self.app.parse_command("ENERGY NEWS")
+        state = {"news_category": "MARKETS"}
+        self.app.route_subject(state, parsed["module"], parsed["subject"])
+        assert state["news_category"] == "ENERGY / COMMODITY"
+
+    @pytest.mark.parametrize("subject,desk", [
+        ("ENERGY", "ENERGY / COMMODITY"), ("COMMODITY", "ENERGY / COMMODITY"),
+        ("SHIPPING", "SHIPPING / TRADE"), ("REGULATORY", "REGULATORY"),
+        ("MACRO POLICY", "MACRO / POLICY"),
+    ])
+    def test_news_category_for(self, subject, desk):
+        assert self.app.news_category_for(subject) == desk
+
+    @pytest.mark.parametrize("ticker", ["NVDA", "MA", "GE"])
+    def test_ticker_is_not_mistaken_for_a_desk(self, ticker):
+        """MA and GE are substrings of desk names; they are still tickers."""
+        state = {"news_category": "MARKETS"}
+        self.app.route_subject(state, "news", ticker)
+        assert state["ticker"] == ticker
+        assert state["news_category"] == "MARKETS"
+
+    def test_index_command_sets_yahoo_symbol(self):
+        parsed = self.app.parse_command("SPX INDEX")
+        state: dict = {}
+        self.app.route_subject(state, parsed["module"], parsed["subject"])
+        assert state["ticker"] == "^GSPC"
 
 
 class TestFormatLargeNumber:
