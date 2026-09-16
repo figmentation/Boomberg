@@ -32,6 +32,7 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 import config
@@ -68,6 +69,16 @@ class CacheEntry:
     created_at: float
     expires_at: float
     stale: bool
+    # True when this value was handed back because a refresh failed, rather
+    # than because it was still valid. `stale` only says the TTL has passed,
+    # which for a 60-second quote happens a minute after every fetch and says
+    # nothing about whether the upstream is healthy.
+    served_stale: bool = False
+
+    @property
+    def as_of(self) -> datetime:
+        """When this value was fetched, as an aware UTC datetime."""
+        return datetime.fromtimestamp(self.created_at, timezone.utc)
 
     @property
     def age_seconds(self) -> float:
@@ -97,7 +108,28 @@ class SQLiteCache:
         self.path = str(path or config.CACHE_DB)
         self._local = threading.local()
         self._init_lock = threading.Lock()
+        # Keys last served because a refetch failed. In-process and
+        # deliberately not persisted: it describes what this server is
+        # currently showing, and a restart re-establishes it on the first
+        # fetch that fails.
+        self._fallbacks: Dict[str, float] = {}
+        self._fallback_lock = threading.Lock()
         self._ensure_schema()
+
+    # -- fallback bookkeeping ----------------------------------------------
+    def note_fallback(self, key: str) -> None:
+        """Record that `key` was served after a refresh failed."""
+        with self._fallback_lock:
+            self._fallbacks[key] = time.time()
+
+    def clear_fallback(self, key: str) -> None:
+        """A good value replaced the old one; the entry is no longer a fallback."""
+        with self._fallback_lock:
+            self._fallbacks.pop(key, None)
+
+    def served_as_fallback(self, key: str) -> bool:
+        with self._fallback_lock:
+            return key in self._fallbacks
 
     # -- connection management ---------------------------------------------
     def _conn(self) -> sqlite3.Connection:
@@ -163,6 +195,33 @@ class SQLiteCache:
 
         return CacheEntry(value=value, created_at=created_at,
                           expires_at=expires_at, stale=expired)
+
+    def metadata(self, key: str) -> Optional[CacheEntry]:
+        """
+        Age and expiry for `key` without unpickling the value.
+
+        What the UI needs to render a freshness badge is only ever the
+        timestamps, and a page can ask about a dozen fetchers per run.
+        `value` comes back as None, `stale` means the TTL has passed, and
+        `served_stale` means this value is on screen because a refresh
+        failed - the two the badge keeps apart.
+        """
+        try:
+            row = self._conn().execute(
+                "SELECT created_at, expires_at FROM kv WHERE key = ?", (key,),
+            ).fetchone()
+        except Exception as exc:
+            log.debug("Cache metadata error for %s: %s", key, exc)
+            return None
+
+        if row is None:
+            return None
+
+        created_at, expires_at = row
+        return CacheEntry(value=None, created_at=created_at,
+                          expires_at=expires_at,
+                          stale=time.time() >= expires_at,
+                          served_stale=self.served_as_fallback(key))
 
     def set(self, key: str, value: Any, ttl: int, namespace: str = "default") -> None:
         """Store `value` under `key` for `ttl` seconds. Never raises."""
@@ -299,26 +358,34 @@ def cached(
                               with nothing to protect is cached for at most
                               EMPTY_RESULT_TTL seconds.
 
-    The wrapper exposes two extras:
-        fn.cache_clear()      Drop every entry in this namespace.
-        fn.uncached(*a, **k)  Bypass the cache for one call.
+    The wrapper exposes:
+        fn.cache_clear()       Drop every entry in this namespace.
+        fn.uncached(*a, **k)   Bypass the cache for one call.
+        fn.cache_key(*a, **k)  The key one call reads and writes.
+        fn.provenance(*a, **k) Age and expiry of that call's entry, or None
+                               if nothing is stored yet. Pass the same
+                               arguments the fetch was made with.
 
     Pass `_refresh=True` to skip the fresh read for one call. The existing
     entry stays in place until a good value replaces it, so a refresh during
     an outage still has something to fall back on.
 
-    Provenance for the *most recent* call is recorded on
-    `fn.last_entry` (a CacheEntry or None) so the UI can render an age badge.
+    `fn.last_entry` records the *most recent* call anywhere in the process.
+    Prefer `fn.provenance(...)`: it is keyed by the arguments, so a badge
+    cannot end up describing another ticker's fetch, or another session's.
     """
 
     def decorator(func: F) -> F:
         ns = namespace or func.__name__
         cache = get_cache()
 
+        def key_for(*args: Any, **kwargs: Any) -> str:
+            return key_fn(*args, **kwargs) if key_fn else make_key(ns, *args, **kwargs)
+
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             refresh = kwargs.pop("_refresh", False)
-            key = key_fn(*args, **kwargs) if key_fn else make_key(ns, *args, **kwargs)
+            key = key_for(*args, **kwargs)
 
             # Offline mode: cache is the only source of truth.
             if config.OFFLINE:
@@ -346,7 +413,9 @@ def cached(
                             "%s failed (%s) - serving stale value from %s",
                             ns, exc, stale.age_label(),
                         )
-                        wrapper.last_entry = replace(stale, stale=True)  # type: ignore[attr-defined]
+                        cache.note_fallback(key)
+                        wrapper.last_entry = replace(  # type: ignore[attr-defined]
+                            stale, stale=True, served_stale=True)
                         return stale.value
                 raise
 
@@ -358,11 +427,14 @@ def cached(
                         "%s returned nothing - keeping the value from %s",
                         ns, previous.age_label(),
                     )
-                    wrapper.last_entry = replace(previous, stale=True)  # type: ignore[attr-defined]
+                    cache.note_fallback(key)
+                    wrapper.last_entry = replace(  # type: ignore[attr-defined]
+                        previous, stale=True, served_stale=True)
                     return previous.value
                 entry_ttl = min(ttl, EMPTY_RESULT_TTL)
 
             cache.set(key, value, ttl=entry_ttl, namespace=ns)
+            cache.clear_fallback(key)
             now = time.time()
             wrapper.last_entry = CacheEntry(  # type: ignore[attr-defined]
                 value=value, created_at=now,
@@ -374,6 +446,9 @@ def cached(
         wrapper.cache_clear = lambda: cache.clear(ns)   # type: ignore[attr-defined]
         wrapper.uncached = func              # type: ignore[attr-defined]
         wrapper.namespace = ns               # type: ignore[attr-defined]
+        wrapper.cache_key = key_for          # type: ignore[attr-defined]
+        wrapper.provenance = (               # type: ignore[attr-defined]
+            lambda *a, **k: cache.metadata(key_for(*a, **k)))
         return wrapper  # type: ignore[return-value]
 
     return decorator

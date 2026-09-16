@@ -360,6 +360,11 @@ def _tape_quotes() -> Dict[str, Dict[str, Any]]:
 def render_tape() -> None:
     labels = dict(config.TAPE_SYMBOLS)
     ui.ticker_tape(_tape_quotes(), labels)
+    # The tape is the one thing on screen from every page, and the thing most
+    # likely to be read as live. It says how old it is.
+    ui.provenance_row([_age_chip(
+        equities.get_quotes_batch, tuple(sym for sym, _ in config.TAPE_SYMBOLS),
+        source="YAHOO", delayed_minutes=ui.YAHOO_DELAY_MINUTES)])
 
 
 def render_command_bar(principal: entitlements.Principal) -> None:
@@ -768,9 +773,11 @@ def page_home() -> None:
                          ("BTC-USD", "BITCOIN"), ("ETH-USD", "ETHER")]
 
     # One batched request covering every tile on this page.
-    quotes = _home_quotes(tuple(
-        sym for sym, _ in index_symbols + commodity_symbols
-    ))
+    home_symbols = tuple(sym for sym, _ in index_symbols + commodity_symbols)
+    quotes = _home_quotes(home_symbols)
+    ui.provenance_row([_age_chip(
+        equities.get_quotes_batch, home_symbols,
+        source="YAHOO", delayed_minutes=ui.YAHOO_DELAY_MINUTES)])
     tiles = []
     for symbol, label in index_symbols:
         quote = quotes.get(symbol, {})
@@ -940,6 +947,14 @@ def page_equity() -> None:
         )
         return
 
+    ui.provenance_row([
+        # market_time is the exchange's own last-trade stamp, so this chip
+        # dates the price rather than our request for it.
+        _age_chip(equities.get_quote, ticker, source="YAHOO",
+                  delayed_minutes=ui.YAHOO_DELAY_MINUTES,
+                  as_of=quote.get("market_time")),
+        _age_chip(equities.get_company_info, ticker, source="YAHOO PROFILE"),
+    ])
     ui.quote_tiles(quote, info)
 
     tabs = st.tabs(["CHART", "FUNDAMENTALS", "SEC FILINGS",
@@ -2076,6 +2091,7 @@ def page_macro() -> None:
     # ---- YIELD CURVE -----------------------------------------------------
     with tabs[1]:
         curve = _safe(macro.get_yield_curve, default=pd.DataFrame())
+        ui.provenance_row([_age_chip(macro.get_yield_curve, source="FRED")])
 
         if curve.empty:
             ui.alert("Yield curve data unavailable from every source.", "error")
@@ -2702,6 +2718,12 @@ def page_fundamentals() -> None:
     if not report:
         ui.alert(f"Fundamental analysis unavailable for {ticker}.", "error")
         return
+
+    ui.provenance_row([
+        _age_chip(equities.get_sec_company_facts, ticker, source="SEC EDGAR XBRL"),
+        _age_chip(equities.get_quote, ticker, source="YAHOO",
+                  delayed_minutes=ui.YAHOO_DELAY_MINUTES),
+    ])
 
     if report.get("verdict") == "INSUFFICIENT DATA" and "reason" in report:
         ui.alert(report["reason"], "warn")
@@ -3359,6 +3381,40 @@ Cloudflare. Enabling them is a decision you make deliberately with
 # ==========================================================================
 # ERROR HANDLING HELPERS
 # ==========================================================================
+def _stamp(value: Any) -> Optional[datetime]:
+    """Parse a fetcher's own ISO timestamp, or None if it has none."""
+    if not value:
+        return None
+    try:
+        parsed = pd.Timestamp(value)
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.tz_localize("UTC")
+    return parsed.to_pydatetime()
+
+
+def _age_chip(fetcher: Any, *args: Any, source: str = "",
+              delayed_minutes: int = 0, as_of: Any = None) -> str:
+    """
+    Provenance chip for one fetcher call.
+
+    The arguments after `fetcher` must be the ones it was called with: the
+    cache is keyed on them, and a chip built from a different key would
+    describe some other symbol's fetch.
+    """
+    provenance = None
+    lookup = getattr(fetcher, "provenance", None)
+    if lookup is not None:
+        try:
+            provenance = lookup(*args)
+        except Exception as exc:
+            log.debug("No provenance for %s: %s",
+                      getattr(fetcher, "__name__", fetcher), exc)
+    return ui.data_age(provenance, source=source,
+                       delayed_minutes=delayed_minutes, as_of=_stamp(as_of))
+
+
 def _safe(func, *args, default: Any = None, **kwargs) -> Any:
     """
     Call a fetcher, converting any exception into a UI warning + default.
@@ -3695,6 +3751,14 @@ def page_portfolio() -> None:
     with st.spinner("Marking positions to market…"):
         valued = portfolio.value_positions(stored_holdings)
     summary = portfolio.portfolio_summary(valued)
+
+    if not stored_holdings.empty:
+        # The same tuple portfolio._quotes builds, so this describes the
+        # request the marks actually came from.
+        ui.provenance_row([_age_chip(
+            equities.get_quotes_batch,
+            tuple(sorted(set(stored_holdings["ticker"]))),
+            source="YAHOO", delayed_minutes=ui.YAHOO_DELAY_MINUTES)])
 
     now_sgt = portfolio.sgt_now()
     edition = portfolio.edition_date(now_sgt)

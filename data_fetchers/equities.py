@@ -166,6 +166,7 @@ def get_quote(ticker: str) -> Dict[str, Any]:
 
     price = prev_close = None
     volume = day_high = day_low = market_cap = None
+    market_time = None
 
     try:
         fi = tk.fast_info
@@ -181,6 +182,18 @@ def get_quote(ticker: str) -> Dict[str, Any]:
         if is_transient_error(exc):
             raise
         log.debug("fast_info failed for %s: %s", ticker, exc)
+
+    # The exchange's own timestamp for this price, off the chart metadata the
+    # fast_info call above already fetched - no extra request. Without it the
+    # only timestamp on a quote was the moment we asked for it, which reads
+    # as "current" on a Monday for a price that last moved on Friday.
+    try:
+        epoch = _safe_float((getattr(tk, "history_metadata", None) or {})
+                            .get("regularMarketTime"))
+        if epoch:
+            market_time = datetime.fromtimestamp(epoch, timezone.utc).isoformat()
+    except Exception as exc:
+        log.debug("No market timestamp for %s: %s", ticker, exc)
 
     # Fallback: derive from recent daily bars.
     if price is None or prev_close is None:
@@ -200,6 +213,7 @@ def get_quote(ticker: str) -> Dict[str, Any]:
         change = price - prev_close
         change_pct = (change / prev_close) * 100.0
 
+    fetched_at = datetime.now(timezone.utc).isoformat()
     return {
         "ticker": ticker,
         "price": price,
@@ -210,7 +224,13 @@ def get_quote(ticker: str) -> Dict[str, Any]:
         "day_high": day_high,
         "day_low": day_low,
         "market_cap": market_cap,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        # When the price last traded, per the exchange. None when Yahoo did
+        # not say - a fallback to the fetch time would be a made-up trade time.
+        "market_time": market_time,
+        "fetched_at": fetched_at,
+        # Kept for callers that read `timestamp`: the trade time when known,
+        # and the fetch time otherwise.
+        "timestamp": market_time or fetched_at,
     }
 
 

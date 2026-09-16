@@ -483,6 +483,30 @@ is "0.0% above cost", because that reads exactly like a real result. The
 figures are stored with the edition, so an archived brief describes the book
 as it was that morning.
 
+### Every number says how old it is
+
+The cache always recorded when a value was fetched and whether it was handed
+back after a failed refresh; nothing rendered it, so an upstream outage
+looked exactly like a quiet market. Each page now carries a provenance chip
+per source:
+
+| Badge | Means |
+|---|---|
+| `LIVE` | Fetched moments ago from a feed that is not delayed |
+| `CACHED` | Older than two minutes, and current as far as we know |
+| `DELAYED 15M` | From a feed that publishes late — Yahoo quotes, indices and FX |
+| `STALE` | On screen because a refresh **failed** |
+
+`STALE` deliberately does not mean "past its TTL". A 60-second quote is past
+its TTL a minute after every fetch with nothing wrong, and a badge that
+flashed every minute would be ignored by the time it mattered.
+
+Quotes are dated by the exchange's own last-trade time (`AS OF`), read from
+the chart metadata Yahoo already returns, so a Monday morning screen shows
+Friday's close as Friday's. Where a source publishes no timestamp the chip
+says `FETCHED` and dates our request instead, rather than implying the two
+are the same.
+
 ### Access control and audit
 
 On your own machine nothing changes: there is one user, and that user is

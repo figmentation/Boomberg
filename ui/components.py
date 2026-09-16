@@ -576,6 +576,106 @@ def gauge(
 
 
 # ==========================================================================
+# DATA PROVENANCE
+# ==========================================================================
+# Yahoo publishes equity, index and FX quotes on a 15-minute delay. That is a
+# property of the feed, not of our cache, so no TTL can make it LIVE.
+YAHOO_DELAY_MINUTES = 15
+
+# Inside its TTL a value is current, but "LIVE" against something fetched
+# hours ago reads as a live market. Past this, a fresh entry says CACHED and
+# lets its age speak - the 24h profile and fundamentals TTLs are the case
+# that matters.
+LIVE_WITHIN_SECONDS = 120
+
+
+def _since(stamp: datetime) -> str:
+    """'4m ago' for a past timestamp; a future one reads as 'just now'."""
+    seconds = (datetime.now(timezone.utc) - stamp).total_seconds()
+    if seconds < 1:
+        return "just now"
+    if seconds < 60:
+        return f"{int(seconds)}s ago"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m ago"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h ago"
+    return f"{int(seconds // 86400)}d ago"
+
+
+def data_age(provenance: Any = None, *, source: str = "",
+             delayed_minutes: int = 0,
+             as_of: Optional[datetime] = None) -> str:
+    """
+    One provenance chip: how current a value is, when it is from, and whose.
+
+    Returns HTML so several chips can share a line.
+
+      LIVE      fetched moments ago, from a feed that is not delayed
+      CACHED    older than LIVE_WITHIN_SECONDS, and current as far as we know
+      DELAYED   from a feed that publishes late (Yahoo: 15 minutes)
+      STALE     on screen because a refresh FAILED - so it outranks the rest
+
+    STALE deliberately does not mean "past its TTL". A 60-second quote is
+    past its TTL a minute after every fetch, with nothing wrong; a badge that
+    flashed STALE every minute would be ignored by the time it mattered.
+
+    `as_of` is the data's own timestamp where the source publishes one, such
+    as the exchange's last-trade time on a quote. Without it the chip shows
+    when the value was fetched and says FETCHED rather than AS OF: "3s ago"
+    against a price that last moved on Friday is worse than no badge at all.
+
+    Returns "" when nothing is known, because a badge that cannot say how old
+    the data is has nothing to tell the reader.
+    """
+    if provenance is None and as_of is None:
+        return ""
+
+    fetched = getattr(provenance, "as_of", None)
+    measured = fetched if fetched is not None else as_of
+    recent = (measured is not None
+              and (datetime.now(timezone.utc) - measured).total_seconds()
+              <= LIVE_WITHIN_SECONDS)
+
+    if getattr(provenance, "served_stale", False):
+        state, colour = "STALE", "amber"
+    elif delayed_minutes > 0:
+        state, colour = f"DELAYED {delayed_minutes}M", "cyan"
+    elif recent:
+        state, colour = "LIVE", "green"
+    else:
+        state, colour = "CACHED", "muted"
+
+    stamp = as_of if as_of is not None else fetched
+    details: List[str] = []
+    if stamp is not None:
+        stamp = stamp.astimezone(timezone.utc)
+        label = "AS OF" if as_of is not None else "FETCHED"
+        details.append(f"{label} {stamp:%Y-%m-%d %H:%M} UTC")
+        details.append(_since(stamp))
+    if source:
+        details.append(source)
+
+    return (
+        f'<span style="white-space:nowrap;">{badge(state, colour)}'
+        f'<span style="color:{THEME.muted};font-size:10px;letter-spacing:0.06em;">'
+        f'{html.escape(" · ".join(details))}</span></span>'
+    )
+
+
+def provenance_row(chips: Sequence[str]) -> None:
+    """Render the chips a page has, on one line. Empty ones are dropped."""
+    present = [chip for chip in chips if chip]
+    if not present:
+        return
+    st.markdown(
+        f'<div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;'
+        f'margin:-2px 0 10px;">{"".join(present)}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ==========================================================================
 # LINKS
 # ==========================================================================
 _SAFE_LINK_SCHEMES = frozenset({"http", "https"})
